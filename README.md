@@ -8,7 +8,7 @@ Model, transform, texture, and map from Blender directly to the s&box scene edit
 
 ### Requirements
 - **Blender 5.1+**
-- **s&box** with the [Blender Bridge library](https://sbox.game/) installed
+- **s&box** with the [Blender Bridge library]([https://sbox.game/](https://sbox.game/kamishell/blender_bridge)) installed
 
 ### Install the Addon
 
