@@ -78,8 +78,8 @@ The addon adds an **s&box** tab to Blender's N-panel with:
 - **Materials show pink/error**: Set your Assets Path. New `.vmat` files need a moment to compile in s&box
 - **Area light warning**: s&box doesn't support area lights — use point or spot instead
 - **Frozen UI on large mesh**: If you hit this, the mesh exceeded the chunk threshold. Try reducing polygon count
-- **Hammer editor might need to be open to place meshes can be closed after.
-- **to play a scene you might need to save (ctrl + S) the scene after editing to see geometry appear in Play mode (s&box).
+- **Hammer editor might need to be open** to place meshes can be closed after.
+- **To Play a scene** you might need to **save (ctrl + S)** the scene after editing to see geometry appear in Play mode (s&box).
 
 ## License
 
