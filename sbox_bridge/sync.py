@@ -629,9 +629,19 @@ def _handle_play_mode(msg):
 
 
 def _handle_sync_response(msg):
-    """Full sync from s&box. Reconcile Blender state."""
+    """Full sync from s&box. Reconcile Blender state.
+    Only creates Blender objects for s&box-originated objects that Blender doesn't have.
+    Never re-creates objects that Blender itself sent — those already exist locally."""
+    global _last_known_bridge_ids
     objects = msg.get("objects", [])
     received_ids = set()
+
+    # Collect all bridge IDs Blender currently has BEFORE processing
+    local_ids = set()
+    for obj in bpy.data.objects:
+        bid = get_bridge_id(obj)
+        if bid:
+            local_ids.add(bid)
 
     for obj_data in objects:
         # Handle inline deletes from reconciliation
@@ -659,15 +669,14 @@ def _handle_sync_response(msg):
 
         existing = find_by_bridge_id(bridge_id)
         if existing:
+            # Object exists in Blender — just update transform, don't touch mesh/materials
             _apply_sbox_transform(existing, obj_data)
-            # Update name if changed in s&box
             name = obj_data.get("name")
             if name and existing.name != name:
                 existing.name = name
-            mesh_data = obj_data.get("meshData")
-            if mesh_data and mesh_data.get("vertices"):
-                _rebuild_mesh(existing, mesh_data)
-        else:
+        elif bridge_id not in local_ids:
+            # Object exists in s&box but NOT in Blender — create it
+            # (Skip if Blender had this ID before processing, meaning we just sent it)
             _create_from_sbox(obj_data)
 
     # Reconcile: remove stale objects that s&box no longer has
@@ -679,15 +688,8 @@ def _handle_sync_response(msg):
 
     _last_known_bridge_ids = received_ids.copy()
 
-    # Send create for Blender-only objects (immediate, not deferred)
-    for obj in list(bpy.data.objects):
-        if obj.get("sbox_scene_id") or obj.get("sbox_type"):
-            continue
-        if obj.type == "MESH" and not get_bridge_id(obj):
-            send_create(obj)
-        elif obj.type == "LIGHT" and not get_bridge_id(obj):
-            if obj.data and obj.data.type not in UNSUPPORTED_LIGHT_TYPES:
-                send_create_light(obj)
+    # Do NOT auto-send creates here — Sync All and Force Resync handle that
+    # before calling send_sync(). Auto-creating here causes duplicate feedback loops.
 
     print(f"[Bridge] Sync complete: {len(received_ids)} bridge objects from s&box")
 

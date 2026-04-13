@@ -25,6 +25,15 @@ class SBOX_OT_Connect(bpy.types.Operator):
         if success:
             settings.is_connected = True
             sync.start_timer()
+            # Send unsynced Blender objects first, then request sync from s&box
+            for obj in list(bpy.data.objects):
+                if obj.get("sbox_scene_id") or obj.get("sbox_type"):
+                    continue
+                if obj.type == "MESH" and not sync.get_bridge_id(obj):
+                    sync.send_create(obj)
+                elif obj.type == "LIGHT" and not sync.get_bridge_id(obj):
+                    if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
+                        sync.send_create_light(obj)
             sync.send_sync()
             self.report({"INFO"}, f"Connected to s&box at {settings.host}:{settings.port}")
         else:
