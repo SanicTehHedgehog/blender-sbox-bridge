@@ -7,10 +7,18 @@ Model, transform, texture, and map from Blender directly to the s&box scene edit
 ## Installation
 
 ### Requirements
-- **Blender 5.1+**
+- **Blender 4.2+**
 - **s&box** with the [Blender Bridge library](https://sbox.game/kamishell/blender_bridge) installed
 
-### Install the Addon
+### Install via Blender Extension Repository (auto-updates)
+
+1. In Blender: **Edit > Preferences > Get Extensions**
+2. Click the **Repositories** dropdown (top-right) > **Add Remote Repository**
+3. URL: `https://sanictehhedgehog.github.io/blender-sbox-bridge/index.json`
+4. The addon appears in the extension browser — click **Install**
+5. Updates are automatic from now on
+
+### Manual Install (alternative)
 
 1. Download `sbox_bridge.zip` from the [latest release](https://github.com/SanicTehHedgehog/blender-sbox-bridge/releases)
 2. In Blender: **Edit > Preferences > Add-ons > Install from Disk**
