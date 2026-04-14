@@ -6,7 +6,7 @@ Features sync direction controls, hierarchy mapping, status indicators, and geom
 bl_info = {
     "name": "s&box Bridge",
     "author": "SanicTehHedgehog",
-    "version": (3, 0, 0),
+    "version": (3, 2, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > s&box",
     "description": "Bidirectional scene sync with s&box game engine",
@@ -64,6 +64,10 @@ class SboxBridgeSettings(bpy.types.PropertyGroup):
         ],
         default='BIDIRECTIONAL',
         description="Controls how data flows between Blender and s&box",
+    )
+    show_activity_log: bpy.props.BoolProperty(
+        name="Activity Log", default=False,
+        description="Show the activity log",
     )
 
 

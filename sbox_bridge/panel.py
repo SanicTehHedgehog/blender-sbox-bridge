@@ -672,6 +672,38 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
 
         layout.separator()
 
+        # ── Activity Log (collapsible) ───────────────────────────
+        try:
+            settings = context.scene.sbox_bridge
+            box = layout.box()
+            row = box.row()
+            row.prop(settings, "show_activity_log",
+                     icon="TRIA_DOWN" if settings.show_activity_log else "TRIA_RIGHT",
+                     emboss=False)
+
+            if settings.show_activity_log:
+                log_entries = sync.get_activity_log()
+                if log_entries:
+                    import time as _time
+                    now = _time.time()
+                    for timestamp, msg in reversed(log_entries[-15:]):
+                        elapsed = now - timestamp
+                        if elapsed < 60:
+                            time_str = f"{elapsed:.0f}s"
+                        elif elapsed < 3600:
+                            time_str = f"{elapsed / 60:.0f}m"
+                        else:
+                            time_str = f"{elapsed / 3600:.1f}h"
+                        row = box.row()
+                        row.scale_y = 0.7
+                        row.label(text=f"[{time_str}] {msg}")
+                else:
+                    box.label(text="No activity yet")
+        except Exception:
+            pass
+
+        layout.separator()
+
         # ── Materials ─────────────────────────────────────────────
         try:
             import os

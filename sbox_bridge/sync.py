@@ -31,6 +31,7 @@ from . import connection
 
 _suppress_depsgraph = False
 _timer_running = False
+_remote_update_times = {}       # bridgeId -> time.time() when last updated from s&box
 
 # Sequence-based echo prevention
 _blender_seq = 0
@@ -44,6 +45,7 @@ _last_transform_send = {}       # bridgeId -> time.time() of last transform send
 _mesh_debounce_obj = {}         # bridgeId -> obj reference
 _mesh_debounce_scheduled = set()
 _last_scale = {}                # bridgeId -> (sx, sy, sz)
+_hidden_bridge_ids = set()      # bridgeIds currently hidden in Blender (deleted from s&box)
 
 # Material caching
 _material_hash_cache = {}       # material_name -> (content_hash, vmat_rel_path)
@@ -223,13 +225,35 @@ def get_or_create_collection_path(path_list):
     return parent
 
 
+# ── Activity Log ─────────────────────────────────────────────────────────
+
+_activity_log = []              # [(timestamp, message)]
+MAX_LOG_ENTRIES = 50
+
+
+def log_activity(message):
+    """Add an entry to the activity log visible in the Blender panel."""
+    _activity_log.append((time.time(), message))
+    if len(_activity_log) > MAX_LOG_ENTRIES:
+        _activity_log.pop(0)
+    print(f"[Bridge] {message}")
+
+
+def get_activity_log():
+    return list(_activity_log)
+
+
+def clear_activity_log():
+    _activity_log.clear()
+
+
 # ── Warnings & Status ────────────────────────────────────────────────────
 
 def add_warning(message):
     _warnings.append((time.time(), message))
     if len(_warnings) > 10:
         _warnings.pop(0)
-    print(f"[Bridge] WARNING: {message}")
+    log_activity(f"WARNING: {message}")
 
 
 def get_warnings():
@@ -315,9 +339,9 @@ def send_create(obj):
             set_sync_status(obj, "synced")
             _last_write_seq[response["bridgeId"]] = _blender_seq
             _last_known_bridge_ids.add(response["bridgeId"])
-            print(f"[Bridge] Created: {obj.name} -> {response['bridgeId']}")
+            log_activity(f"Created: {obj.name} -> {response['bridgeId']}")
         else:
-            print(f"[Bridge] Create failed '{obj.name}': {response}")
+            log_activity(f"Create failed '{obj.name}': {response}")
     except Exception as e:
         print(f"[Bridge] Create error '{obj.name}': {e}")
 
@@ -519,7 +543,7 @@ def send_delete(bridge_id):
     }
     connection.send(msg)
     _last_write_seq.pop(bridge_id, None)
-    print(f"[Bridge] Sent delete: {bridge_id}")
+    log_activity(f"Sent delete: {bridge_id}")
 
 
 def send_sync():
@@ -579,7 +603,7 @@ def send_create_light(obj):
         set_bridge_id(obj, response["bridgeId"])
         _last_write_seq[response["bridgeId"]] = _blender_seq
         _last_known_bridge_ids.add(response["bridgeId"])
-        print(f"[Bridge] Created light: {obj.name} -> {response['bridgeId']}")
+        log_activity(f"Created light: {obj.name} -> {response['bridgeId']}")
     else:
         print(f"[Bridge] Light create failed '{obj.name}': {response}")
 
@@ -667,6 +691,8 @@ def process_incoming(msg):
             _handle_sync_response(msg)
         elif msg_type == "mesh_updated":
             _handle_mesh_updated(msg)
+        elif msg_type == "object_created":
+            _handle_object_created(msg)
         elif msg_type == "scene_updated":
             _handle_scene_updated(msg)
         elif msg_type == "light_updated":
@@ -692,6 +718,7 @@ def _handle_updated(msg):
     if not obj:
         return
 
+    _remote_update_times[bridge_id] = time.time()
     _apply_sbox_transform(obj, msg)
 
 
@@ -709,6 +736,7 @@ def _handle_mesh_updated(msg):
     if not obj:
         return
 
+    _remote_update_times[bridge_id] = time.time()
     _apply_sbox_transform(obj, msg)
 
     # Export Only mode — never overwrite Blender mesh with s&box data
@@ -719,6 +747,19 @@ def _handle_mesh_updated(msg):
     if mesh_data and mesh_data.get("vertices"):
         _rebuild_mesh(obj, mesh_data)
         set_sync_status(obj, "received")
+
+
+def _handle_object_created(msg):
+    """s&box created a new object (native MeshComponent auto-adopted by the bridge)."""
+    bridge_id = msg.get("bridgeId")
+    if not bridge_id:
+        return
+
+    # Don't create if we already have it
+    if find_by_bridge_id(bridge_id):
+        return
+
+    _create_from_sbox(msg)
 
 
 def _handle_deleted(msg):
@@ -732,7 +773,7 @@ def _handle_deleted(msg):
         bpy.data.objects.remove(obj, do_unlink=True)
     _last_known_bridge_ids.discard(bridge_id)
     _last_write_seq.pop(bridge_id, None)
-    print(f"[Bridge] Deleted from s&box: {bridge_id}")
+    log_activity(f"Deleted from s&box: {bridge_id}")
 
 
 def _handle_scene_updated(msg):
@@ -836,7 +877,7 @@ def _handle_sync_response(msg):
     # Do NOT auto-send creates here — Sync All and Force Resync handle that
     # before calling send_sync(). Auto-creating here causes duplicate feedback loops.
 
-    print(f"[Bridge] Sync complete: {len(received_ids)} bridge objects from s&box")
+    log_activity(f"Sync complete: {len(received_ids)} bridge objects from s&box")
 
 
 # ── Object Creation from s&box ──────────────────────────────────────────
@@ -906,7 +947,7 @@ def _create_from_sbox(msg):
         _last_known_bridge_ids.add(bridge_id)
 
     _apply_sbox_transform(obj, msg)
-    print(f"[Bridge] Created from s&box: {name} ({bridge_id})")
+    log_activity(f"Created from s&box: {name} ({bridge_id})")
 
 
 def _rebuild_mesh(obj, mesh_data):
@@ -992,7 +1033,7 @@ def _create_light(msg):
     obj["sbox_type"] = "light"
 
     _apply_sbox_transform(obj, msg)
-    print(f"[Bridge] Light: {name} ({bridge_id or scene_id})")
+    log_activity(f"Light: {name} ({bridge_id or scene_id})")
 
 
 def _apply_light_properties(obj, props):
@@ -1517,6 +1558,8 @@ def on_depsgraph_update(scene, depsgraph):
     if mode == 'MANUAL':
         return
 
+    now = time.time()
+
     for update in depsgraph.updates:
         # Accept Object updates only
         if not isinstance(update.id, bpy.types.Object):
@@ -1529,6 +1572,15 @@ def on_depsgraph_update(scene, depsgraph):
             obj = update.id
         if obj is None:
             continue
+
+        # Skip objects whose transforms were recently set by s&box (echo prevention).
+        # 200ms window covers any delayed depsgraph fires.
+        bid = get_bridge_id(obj)
+        if bid and bid in _remote_update_times:
+            if now - _remote_update_times[bid] < 0.2:
+                continue
+            else:
+                del _remote_update_times[bid]
 
         # Scene objects (models/lights from s&box) — position updates only
         if obj.get("sbox_scene_id") or obj.get("sbox_type"):
@@ -1661,7 +1713,7 @@ def _poll_and_process():
             _current_session_id = session_id
             _last_write_seq.clear()
             _last_sbox_seq_processed = 0
-            print(f"[Bridge] Session changed to {session_id}, resyncing...")
+            log_activity(f"Session changed to {session_id}, resyncing...")
             send_sync()
             return 0.1
 
@@ -1676,6 +1728,7 @@ def _poll_and_process():
 
     _check_duplicates()
     _check_deletions()
+    _check_hidden()
     _confirm_pending_deletes()
     return 0.1
 
@@ -1737,6 +1790,35 @@ def _check_deletions():
             _pending_deletes.append((bid, time.time()))
 
     _last_known_bridge_ids = current_ids
+
+
+def _check_hidden():
+    """Detect bridge objects hidden/unhidden in Blender, sync to s&box."""
+    if not connection.is_connected():
+        return
+
+    for obj in list(bpy.data.objects):
+        bid = get_bridge_id(obj)
+        if not bid:
+            continue
+
+        is_hidden = _should_skip_object(obj)
+
+        if is_hidden and bid not in _hidden_bridge_ids:
+            # Just became hidden — delete from s&box
+            _hidden_bridge_ids.add(bid)
+            send_delete(bid)
+            log_activity(f"Hidden: {obj.name} removed from s&box")
+
+        elif not is_hidden and bid in _hidden_bridge_ids:
+            # Just became visible again — re-send to s&box
+            _hidden_bridge_ids.discard(bid)
+            _strip_bridge_props(obj)
+            if obj.type == "MESH":
+                send_create(obj)
+            elif obj.type == "LIGHT":
+                send_create_light(obj)
+            log_activity(f"Unhidden: {obj.name} re-sent to s&box")
 
 
 def _confirm_pending_deletes():
