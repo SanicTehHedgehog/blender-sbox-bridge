@@ -567,10 +567,27 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 box.label(text="  ".join(parts))
 
             # Object list (max 20 shown)
+            import time as _time
+            now = _time.time()
             for obj_name, status in bridge_objs[:20]:
                 row = box.row(align=True)
                 icon = STATUS_ICONS.get(status, "QUESTION")
-                row.label(text=obj_name, icon=icon)
+
+                # Build label with relative time since last sync
+                obj_ref = bpy.data.objects.get(obj_name)
+                last_sync = obj_ref.get("sbox_bridge_last_sync", 0) if obj_ref else 0
+                if last_sync > 0:
+                    elapsed = now - last_sync
+                    if elapsed < 60:
+                        time_str = f"{elapsed:.0f}s ago"
+                    elif elapsed < 3600:
+                        time_str = f"{elapsed / 60:.0f}m ago"
+                    else:
+                        time_str = f"{elapsed / 3600:.1f}h ago"
+                    row.label(text=f"{obj_name}  ({time_str})", icon=icon)
+                else:
+                    row.label(text=obj_name, icon=icon)
+
                 op = row.operator("sbox.bridge_select_object", text="", icon="RESTRICT_SELECT_OFF")
                 op.obj_name = obj_name
 

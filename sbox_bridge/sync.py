@@ -129,8 +129,9 @@ def _should_skip_object(obj):
 # ── Geometry Hash & Sync Status ──────────────────────────────────────────
 
 def geometry_hash(obj):
-    """Fast hash of vertex/face data for change detection.
-    Returns a 12-char hex string, or empty string if no mesh."""
+    """Fast hash of vertex/face data + scale for change detection.
+    Returns a 12-char hex string, or empty string if no mesh.
+    Includes object scale since we bake it into world-space vertices."""
     import struct
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -140,7 +141,11 @@ def geometry_hash(obj):
             return ""
         verts = [c for v in mesh.vertices for c in v.co]
         faces = [vi for p in mesh.polygons for vi in p.vertices]
-        data = struct.pack(f'{len(verts)}f', *verts) + struct.pack(f'{len(faces)}i', *faces)
+        # Include scale in hash — scale changes affect the world-space vertices we send
+        scale = [round(s, 4) for s in obj.scale]
+        data = (struct.pack(f'{len(verts)}f', *verts)
+                + struct.pack(f'{len(faces)}i', *faces)
+                + struct.pack('3f', *scale))
         eval_obj.to_mesh_clear()
         return hashlib.md5(data).hexdigest()[:12]
     except Exception:
@@ -155,6 +160,8 @@ def get_sync_status(obj):
 def set_sync_status(obj, status):
     """Set sync status: unsent, synced, modified, received."""
     obj["sbox_bridge_status"] = status
+    if status in ("synced", "received"):
+        obj["sbox_bridge_last_sync"] = time.time()
 
 
 def get_stored_hash(obj):
@@ -1556,7 +1563,12 @@ def on_depsgraph_update(scene, depsgraph):
         bridge_id = get_bridge_id(obj)
 
         if bridge_id:
-            if update.is_updated_geometry or _scale_changed(obj, bridge_id):
+            # Read scale from the evaluated copy (update.id) since .original
+            # may not have the updated scale during interactive transforms
+            eval_scale = tuple(round(s, 4) for s in update.id.scale)
+            is_geo = update.is_updated_geometry
+            is_scale = _scale_changed_with(bridge_id, eval_scale)
+            if is_geo or is_scale:
                 set_sync_status(obj, "modified")
                 _schedule_mesh_update(bridge_id, obj)
             else:
@@ -1572,11 +1584,16 @@ def on_depsgraph_update(scene, depsgraph):
 def _scale_changed(obj, bridge_id):
     """Check if the object's scale changed since last check."""
     current = tuple(round(s, 4) for s in obj.scale)
+    return _scale_changed_with(bridge_id, current)
+
+
+def _scale_changed_with(bridge_id, current_scale):
+    """Check if scale changed, given pre-computed scale tuple."""
     prev = _last_scale.get(bridge_id)
-    _last_scale[bridge_id] = current
+    _last_scale[bridge_id] = current_scale
     if prev is None:
         return False
-    return current != prev
+    return current_scale != prev
 
 
 def _schedule_mesh_update(bridge_id, obj):
