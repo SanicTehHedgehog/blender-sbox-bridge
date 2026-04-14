@@ -11,7 +11,7 @@ type = "add-on"
 blender_version_min = "4.2.0"
 
 # License
-license = ["SPDX:MIT"]
+license = ["SPDX:GPL-3.0-or-later"]
 
 # Website
 website = "https://github.com/SanicTehHedgehog/blender-sbox-bridge"

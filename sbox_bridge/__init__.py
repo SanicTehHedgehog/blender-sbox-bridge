@@ -3,16 +3,6 @@ s&box Bridge v2 - Bidirectional scene sync between Blender and s&box.
 Full rewrite with sequence-based sync, light support, and chunked mesh transfer.
 """
 
-bl_info = {
-    "name": "s&box Bridge",
-    "author": "Prealpha",
-    "version": (2, 0, 0),
-    "blender": (5, 1, 0),
-    "location": "View3D > Sidebar > s&box",
-    "description": "Bidirectional scene sync with s&box game engine",
-    "category": "Scene",
-}
-
 import bpy
 from . import connection
 from . import sync
