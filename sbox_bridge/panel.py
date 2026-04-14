@@ -228,6 +228,59 @@ class SBOX_OT_ClearBridgeID(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SBOX_OT_SendChildren(bpy.types.Operator):
+    bl_idname = "sbox.bridge_send_children"
+    bl_label = "Send Children"
+    bl_description = "Send all mesh children of the active collection to s&box"
+
+    @classmethod
+    def poll(cls, context):
+        return connection.is_connected() and context.collection is not None
+
+    def execute(self, context):
+        col = context.collection
+        if col == context.scene.collection:
+            self.report({"WARNING"}, "Select a specific collection, not Scene Collection")
+            return {"CANCELLED"}
+
+        count = 0
+        for obj in col.all_objects:
+            if obj.type == "MESH" and not obj.get("sbox_scene_id") and not obj.get("sbox_type"):
+                if sync._should_skip_object(obj):
+                    continue
+                if sync.get_bridge_id(obj):
+                    sync.send_update_mesh(obj)
+                else:
+                    sync.send_create(obj)
+                count += 1
+            elif obj.type == "LIGHT" and not obj.get("sbox_scene_id"):
+                if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
+                    if sync.get_bridge_id(obj):
+                        sync.send_update_light(obj)
+                    else:
+                        sync.send_create_light(obj)
+                    count += 1
+
+        self.report({"INFO"}, f"Sent {count} objects from '{col.name}'")
+        return {"FINISHED"}
+
+
+class SBOX_OT_SelectBridgeObject(bpy.types.Operator):
+    bl_idname = "sbox.bridge_select_object"
+    bl_label = "Select"
+    bl_description = "Select this object in the viewport"
+
+    obj_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.obj_name)
+        if obj:
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+        return {"FINISHED"}
+
+
 class SBOX_OT_ConfirmPendingDeletes(bpy.types.Operator):
     bl_idname = "sbox.bridge_confirm_deletes"
     bl_label = "Confirm Deletes"
@@ -440,6 +493,7 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
             box = layout.box()
             box.label(text="Sync", icon="FILE_REFRESH")
             settings = context.scene.sbox_bridge
+            box.prop(settings, "sync_mode")
             box.prop(settings, "auto_sync")
             box.prop(settings, "scale_factor")
             box.prop(settings, "project_assets_path")
@@ -454,15 +508,76 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 row.operator("sbox.bridge_send_to_scene", icon="EXPORT")
                 row.operator("sbox.bridge_remove_from_scene", icon="REMOVE", text="")
 
-                # Show Clear ID button if any selected object has a bridge ID
                 has_bid = any(sync.get_bridge_id(obj) for obj in context.selected_objects)
                 if has_bid:
                     row = box.row()
                     row.operator("sbox.bridge_clear_id", icon="TRASH")
+
+            # Send Children — active collection
+            if context.collection and context.collection != context.scene.collection:
+                row = box.row()
+                row.operator("sbox.bridge_send_children", icon="OUTLINER_COLLECTION")
         except Exception:
             pass
 
         layout.separator()
+
+        # ── Bridge Objects (status indicators) ────────────────────
+        try:
+            box = layout.box()
+            box.label(text="Bridge Objects", icon="OBJECT_DATA")
+
+            STATUS_ICONS = {
+                "unsent": "RADIOBUT_OFF",
+                "synced": "CHECKMARK",
+                "modified": "FILE_REFRESH",
+                "received": "IMPORT",
+            }
+            STATUS_NAMES = {
+                "unsent": "Not Sent",
+                "synced": "Synced",
+                "modified": "Modified",
+                "received": "Received",
+            }
+
+            counts = {"unsent": 0, "synced": 0, "modified": 0, "received": 0}
+            bridge_objs = []
+
+            for obj in bpy.data.objects:
+                if obj.type not in ("MESH", "LIGHT"):
+                    continue
+                if obj.get("sbox_scene_id") or obj.get("sbox_type"):
+                    continue
+                if sync._should_skip_object(obj):
+                    continue
+
+                status = sync.get_sync_status(obj)
+                bid = sync.get_bridge_id(obj)
+                if not bid:
+                    status = "unsent"
+                counts[status] = counts.get(status, 0) + 1
+                bridge_objs.append((obj.name, status))
+
+            # Summary row
+            parts = []
+            for s in ["synced", "modified", "unsent", "received"]:
+                if counts[s] > 0:
+                    parts.append(f"{counts[s]} {STATUS_NAMES[s].lower()}")
+            if parts:
+                box.label(text="  ".join(parts))
+
+            # Object list (max 20 shown)
+            for obj_name, status in bridge_objs[:20]:
+                row = box.row(align=True)
+                icon = STATUS_ICONS.get(status, "QUESTION")
+                row.label(text=obj_name, icon=icon)
+                op = row.operator("sbox.bridge_select_object", text="", icon="RESTRICT_SELECT_OFF")
+                op.obj_name = obj_name
+
+            if len(bridge_objs) > 20:
+                box.label(text=f"... and {len(bridge_objs) - 20} more")
+        except Exception:
+            pass
 
         # ── Info ──────────────────────────────────────────────────
         try:

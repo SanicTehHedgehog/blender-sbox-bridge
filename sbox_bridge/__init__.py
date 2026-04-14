@@ -45,6 +45,16 @@ class SboxBridgeSettings(bpy.types.PropertyGroup):
         name="Reconnect Interval", default=3.0, min=1.0, max=30.0,
         description="Base interval between reconnect attempts (seconds)",
     )
+    sync_mode: bpy.props.EnumProperty(
+        name="Sync Mode",
+        items=[
+            ('BIDIRECTIONAL', "Bidirectional", "Full two-way sync (default)"),
+            ('EXPORT_ONLY', "Export Only", "Blender to s&box only. s&box never overwrites Blender mesh data"),
+            ('MANUAL', "Manual Only", "No auto-sync. Use Send to Scene / Sync All explicitly"),
+        ],
+        default='BIDIRECTIONAL',
+        description="Controls how data flows between Blender and s&box",
+    )
 
 
 # ── Registration ──────────────────────────────────────────────────────────
@@ -61,6 +71,8 @@ classes = (
     panel.SBOX_OT_SendToScene,
     panel.SBOX_OT_RemoveFromScene,
     panel.SBOX_OT_ClearBridgeID,
+    panel.SBOX_OT_SendChildren,
+    panel.SBOX_OT_SelectBridgeObject,
     panel.SBOX_OT_ConfirmPendingDeletes,
     panel.SBOX_OT_CancelPendingDeletes,
     panel.SBOX_PT_BridgePanel,

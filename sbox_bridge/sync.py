@@ -126,6 +126,96 @@ def _should_skip_object(obj):
     return False
 
 
+# ── Geometry Hash & Sync Status ──────────────────────────────────────────
+
+def geometry_hash(obj):
+    """Fast hash of vertex/face data for change detection.
+    Returns a 12-char hex string, or empty string if no mesh."""
+    import struct
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = eval_obj.to_mesh()
+        if mesh is None:
+            return ""
+        verts = [c for v in mesh.vertices for c in v.co]
+        faces = [vi for p in mesh.polygons for vi in p.vertices]
+        data = struct.pack(f'{len(verts)}f', *verts) + struct.pack(f'{len(faces)}i', *faces)
+        eval_obj.to_mesh_clear()
+        return hashlib.md5(data).hexdigest()[:12]
+    except Exception:
+        return ""
+
+
+def get_sync_status(obj):
+    """Get the sync status of a bridge object."""
+    return obj.get("sbox_bridge_status", "unsent")
+
+
+def set_sync_status(obj, status):
+    """Set sync status: unsent, synced, modified, received."""
+    obj["sbox_bridge_status"] = status
+
+
+def get_stored_hash(obj):
+    """Get the last-sent geometry hash."""
+    return obj.get("sbox_bridge_hash", "")
+
+
+def set_stored_hash(obj, h):
+    """Store the geometry hash after a successful send."""
+    obj["sbox_bridge_hash"] = h
+
+
+def get_sync_mode():
+    """Get the current sync mode from settings."""
+    try:
+        return bpy.context.scene.sbox_bridge.sync_mode
+    except Exception:
+        return 'BIDIRECTIONAL'
+
+
+def get_collection_path(obj):
+    """Get the collection hierarchy path for an object.
+    Returns a list like ["World", "Environment", "Town"]."""
+    for col in bpy.data.collections:
+        if obj.name in col.objects:
+            path = []
+            if _build_collection_path(col, bpy.context.scene.collection, path):
+                return path
+            return [col.name]
+    return []
+
+
+def _build_collection_path(target, current, path):
+    """Recursively find target collection and build path."""
+    for child in current.children:
+        if child == target:
+            path.append(child.name)
+            return True
+        if _build_collection_path(target, child, path):
+            path.insert(len(path) - 1, child.name)
+            return True
+    return False
+
+
+def get_or_create_collection_path(path_list):
+    """Get or create a nested collection path under 's&box Scene'.
+    Returns the deepest collection."""
+    parent = get_or_create_sbox_collection()
+    for name in path_list:
+        child = None
+        for c in parent.children:
+            if c.name == name:
+                child = c
+                break
+        if child is None:
+            child = bpy.data.collections.new(name)
+            parent.children.link(child)
+        parent = child
+    return parent
+
+
 # ── Warnings & Status ────────────────────────────────────────────────────
 
 def add_warning(message):
@@ -193,6 +283,8 @@ def send_create(obj):
 
         px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
         idem_key = f"{obj.name}_{getattr(obj, 'session_uid', id(obj))}"
+        geo_hash = geometry_hash(obj)
+        hierarchy = get_collection_path(obj)
 
         _blender_seq += 1
         msg = {
@@ -204,11 +296,16 @@ def send_create(obj):
             "rotation": _rotation_to_sbox(obj),
             "meshData": mesh_data,
             "idempotencyKey": idem_key,
+            "geometryHash": geo_hash,
+            "hierarchy": hierarchy,
         }
 
         response = connection.send_and_receive(msg)
         if response and "bridgeId" in response:
             set_bridge_id(obj, response["bridgeId"])
+            obj["sbox_bridge_name"] = obj.name
+            set_stored_hash(obj, geo_hash)
+            set_sync_status(obj, "synced")
             _last_write_seq[response["bridgeId"]] = _blender_seq
             _last_known_bridge_ids.add(response["bridgeId"])
             print(f"[Bridge] Created: {obj.name} -> {response['bridgeId']}")
@@ -250,12 +347,19 @@ def send_update_transform(obj):
 
 
 def send_update_mesh(obj):
-    """Send a full mesh update. Uses chunked transfer for large meshes."""
+    """Send a full mesh update. Uses chunked transfer for large meshes.
+    Skips if geometry hash hasn't changed (no-op optimization)."""
     global _blender_seq
 
     bridge_id = get_bridge_id(obj)
     if not bridge_id:
         return
+
+    # Hash check — skip if geometry hasn't actually changed
+    geo_hash = geometry_hash(obj)
+    stored = get_stored_hash(obj)
+    if geo_hash and stored and geo_hash == stored:
+        return  # No actual geometry change
 
     sf = _get_scale_factor()
     mesh_data = _extract_mesh_data(obj, sf)
@@ -266,6 +370,8 @@ def send_update_mesh(obj):
     vert_count = len(mesh_data.get("vertices", [])) // 3
     if vert_count > CHUNK_VERTEX_LIMIT:
         _send_chunked_mesh(obj, bridge_id, mesh_data)
+        set_stored_hash(obj, geo_hash)
+        set_sync_status(obj, "synced")
         return
 
     px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
@@ -282,8 +388,11 @@ def send_update_mesh(obj):
         "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
         "meshData": mesh_data,
+        "geometryHash": geo_hash,
     }
     connection.send(msg)
+    set_stored_hash(obj, geo_hash)
+    set_sync_status(obj, "synced")
 
 
 def _send_chunked_mesh(obj, bridge_id, mesh_data):
@@ -594,9 +703,15 @@ def _handle_mesh_updated(msg):
         return
 
     _apply_sbox_transform(obj, msg)
+
+    # Export Only mode — never overwrite Blender mesh with s&box data
+    if get_sync_mode() == 'EXPORT_ONLY':
+        return
+
     mesh_data = msg.get("meshData")
     if mesh_data and mesh_data.get("vertices"):
         _rebuild_mesh(obj, mesh_data)
+        set_sync_status(obj, "received")
 
 
 def _handle_deleted(msg):
@@ -769,11 +884,18 @@ def _create_from_sbox(msg):
         mesh = bpy.data.meshes.new(f"{name}_mesh")
         obj = bpy.data.objects.new(name, mesh)
 
-    col = get_or_create_sbox_collection()
+    # Link to collection based on hierarchy (if provided) or default
+    hierarchy = msg.get("hierarchy", [])
+    if hierarchy:
+        col = get_or_create_collection_path(hierarchy)
+    else:
+        col = get_or_create_sbox_collection()
     col.objects.link(obj)
 
     if bridge_id:
         set_bridge_id(obj, bridge_id)
+        obj["sbox_bridge_name"] = name
+        set_sync_status(obj, "received")
         _last_known_bridge_ids.add(bridge_id)
 
     _apply_sbox_transform(obj, msg)
@@ -1383,6 +1505,11 @@ def on_depsgraph_update(scene, depsgraph):
     except Exception:
         return
 
+    # Manual mode — skip all auto-sends (user must use buttons)
+    mode = get_sync_mode()
+    if mode == 'MANUAL':
+        return
+
     for update in depsgraph.updates:
         # Accept Object updates only
         if not isinstance(update.id, bpy.types.Object):
@@ -1430,6 +1557,7 @@ def on_depsgraph_update(scene, depsgraph):
 
         if bridge_id:
             if update.is_updated_geometry or _scale_changed(obj, bridge_id):
+                set_sync_status(obj, "modified")
                 _schedule_mesh_update(bridge_id, obj)
             else:
                 send_update_transform(obj)
