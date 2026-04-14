@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "sbox_bridge"
-version = "2.1.0"
+version = "2.1.1"
 name = "s&box Bridge"
 tagline = "Bidirectional scene sync between Blender and the s&box game engine"
 maintainer = "SanicTehHedgehog <gameingmaster86@gmail.com>"

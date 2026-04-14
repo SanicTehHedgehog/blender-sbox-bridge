@@ -1038,12 +1038,23 @@ def _extract_mesh_data(obj, sf):
         if mesh is None:
             return None
 
-        sx, sy, sz = obj.scale
+        # Use the object's world matrix to transform vertices to world space.
+        # This correctly handles scale, rotation, and location in one step,
+        # and avoids the double-scale bug where scale gets re-applied on each sync.
+        # We then subtract the object's world position since s&box applies position separately.
+        world_matrix = obj.matrix_world
+        obj_pos = obj.matrix_world.translation
+
         vertices = []
         for v in mesh.vertices:
-            bx = v.co.x * sx * sf
-            by = v.co.y * sy * sf
-            bz = v.co.z * sz * sf
+            # Transform vertex to world space
+            world_co = world_matrix @ v.co
+            # Subtract object origin (position is sent separately)
+            local_world = world_co - obj_pos
+            # Apply scale factor and convert coordinates
+            bx = local_world.x * sf
+            by = local_world.y * sf
+            bz = local_world.z * sf
             cvt = blender_to_sbox_pos(bx, by, bz)
             vertices.extend(0.0 if (math.isnan(c) or math.isinf(c)) else c for c in cvt)
 
