@@ -1,0 +1,23 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "sbox_bridge",
+      "version": "2.0.1",
+      "name": "s&box Bridge",
+      "tagline": "Bidirectional scene sync between Blender and the s&box game engine",
+      "maintainer": "SanicTehHedgehog <gameingmaster86@gmail.com>",
+      "type": "add-on",
+      "blender_version_min": "4.2.0",
+      "license": ["SPDX:GPL-3.0-or-later"],
+      "website": "https://github.com/SanicTehHedgehog/blender-sbox-bridge",
+      "description": "Stream meshes, lights, materials, and transforms between Blender and s&box in real time. Place objects in either editor and they appear in both.",
+      "tags": ["Import-Export", "3D View", "Scene"],
+      "archive_url": "./sbox_bridge-2.0.1.zip",
+      "archive_size": 20136,
+      "archive_hash": "sha256:ba0b68fcb4b1ba7da1178f30b8c67fdc0959ce03c647d6345a260cdd1989aa00"
+    }
+  ]
+}
