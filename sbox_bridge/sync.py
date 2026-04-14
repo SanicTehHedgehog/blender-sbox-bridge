@@ -223,7 +223,9 @@ def send_update_transform(obj):
         "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
     }
-    connection.send(msg)
+    result = connection.send(msg)
+    if not result:
+        print(f"[Bridge] Transform send FAILED for '{obj.name}' ({bridge_id})")
 
 
 def send_update_mesh(obj):
@@ -1353,7 +1355,12 @@ def on_depsgraph_update(scene, depsgraph):
         if not isinstance(update.id, bpy.types.Object):
             continue
 
-        obj = update.id
+        # The depsgraph gives us the evaluated copy — get the original
+        # so we can access custom properties like sbox_bridge_id
+        obj_eval = update.id
+        obj = obj_eval.original
+        if obj is None:
+            obj = obj_eval
 
         # Scene objects (models/lights from s&box) — position updates only
         if obj.get("sbox_scene_id") or obj.get("sbox_type"):
@@ -1394,6 +1401,7 @@ def on_depsgraph_update(scene, depsgraph):
             if update.is_updated_geometry or _scale_changed(obj, bridge_id):
                 _schedule_mesh_update(bridge_id, obj)
             else:
+                print(f"[Bridge DBG] depsgraph -> transform '{obj.name}' ({bridge_id})")
                 send_update_transform(obj)
         else:
             # New object — detect paste duplicate, then create directly (no timer)
@@ -1504,10 +1512,19 @@ def _check_duplicates():
         return
 
     # Strip bridge IDs from non-syncable types (only MESH and LIGHT should have them)
+    # Use _strip_bridge_props which also removes from _last_known_bridge_ids
+    # so _check_deletions won't send delete messages for these
     for obj in list(bpy.data.objects):
         bid = obj.get("sbox_bridge_id")
         if bid and obj.type not in SYNCABLE_TYPES:
-            _strip_bridge_props(obj)
+            # Silently strip — don't trigger deletes for curves/armatures/etc
+            for key in ["sbox_bridge_id", "_remote_update_time"]:
+                if key in obj:
+                    del obj[key]
+            _last_known_bridge_ids.discard(bid)
+            _last_write_seq.pop(bid, None)
+            # Also remove from pending deletes if it got added
+            _pending_deletes[:] = [(b, t) for b, t in _pending_deletes if b != bid]
             continue
 
     # Detect duplicate IDs on remaining objects

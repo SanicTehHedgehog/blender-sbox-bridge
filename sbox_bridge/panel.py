@@ -65,19 +65,28 @@ class SBOX_OT_SyncAll(bpy.types.Operator):
         return connection.is_connected()
 
     def execute(self, context):
-        count = 0
+        created = 0
+        updated = 0
         for obj in list(bpy.data.objects):
             if obj.get("sbox_scene_id") or obj.get("sbox_type"):
                 continue
-            if obj.type == "MESH" and not sync.get_bridge_id(obj):
-                sync.send_create(obj)
-                count += 1
-            elif obj.type == "LIGHT" and not sync.get_bridge_id(obj):
+            if obj.type == "MESH":
+                if not sync.get_bridge_id(obj):
+                    sync.send_create(obj)
+                    created += 1
+                else:
+                    sync.send_update_mesh(obj)
+                    updated += 1
+            elif obj.type == "LIGHT":
                 if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
-                    sync.send_create_light(obj)
-                    count += 1
+                    if not sync.get_bridge_id(obj):
+                        sync.send_create_light(obj)
+                        created += 1
+                    else:
+                        sync.send_update_light(obj)
+                        updated += 1
         sync.send_sync()
-        self.report({"INFO"}, f"Sent {count} new objects, syncing with s&box")
+        self.report({"INFO"}, f"Synced {created + updated} objects ({created} new, {updated} updated)")
         return {"FINISHED"}
 
 
