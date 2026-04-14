@@ -1335,8 +1335,17 @@ def _apply_sbox_transform(obj, msg):
 
 # ── Depsgraph Handler ───────────────────────────────────────────────────
 
+_depsgraph_call_count = 0
+
 def on_depsgraph_update(scene, depsgraph):
     """Called after every depsgraph update. Routes changes to s&box."""
+    global _depsgraph_call_count
+    _depsgraph_call_count += 1
+
+    # Print every 50th call so we know the handler is alive without flooding
+    if _depsgraph_call_count % 50 == 1:
+        print(f"[Bridge DIAG] depsgraph handler called (#{_depsgraph_call_count}, suppress={_suppress_depsgraph}, connected={connection.is_connected()})")
+
     if _suppress_depsgraph:
         return
     if not connection.is_connected():
@@ -1352,15 +1361,17 @@ def on_depsgraph_update(scene, depsgraph):
         return
 
     for update in depsgraph.updates:
+        # Accept Object updates only
         if not isinstance(update.id, bpy.types.Object):
             continue
 
-        # The depsgraph gives us the evaluated copy — get the original
-        # so we can access custom properties like sbox_bridge_id
-        obj_eval = update.id
-        obj = obj_eval.original
+        # Get the original object (not the evaluated depsgraph copy)
+        try:
+            obj = update.id.original
+        except Exception:
+            obj = update.id
         if obj is None:
-            obj = obj_eval
+            continue
 
         # Scene objects (models/lights from s&box) — position updates only
         if obj.get("sbox_scene_id") or obj.get("sbox_type"):
@@ -1368,26 +1379,19 @@ def on_depsgraph_update(scene, depsgraph):
                 send_scene_transform(obj)
             continue
 
-        # Unsupported types — skip silently
-        if obj.type in UNSUPPORTED_TYPES:
+        # Skip unsupported and convertible types
+        if obj.type in UNSUPPORTED_TYPES or obj.type in CONVERTIBLE_TYPES:
             continue
 
         # Lights
         if obj.type == "LIGHT":
             if obj.data and obj.data.type in UNSUPPORTED_LIGHT_TYPES:
-                add_warning(f"'{obj.name}': AREA lights not supported in s&box")
                 continue
             bridge_id = get_bridge_id(obj)
             if bridge_id:
                 send_update_light(obj)
             elif not obj.get("sbox_scene_id"):
                 send_create_light(obj)
-            continue
-
-        # Convertible types (curves, surfaces, etc.) — skip silently.
-        # These should be converted to mesh first (Alt+C / Ctrl+A) before syncing.
-        # Auto-syncing curves produces empty/invisible geometry in s&box.
-        if obj.type in CONVERTIBLE_TYPES:
             continue
 
         # Non-mesh — skip
@@ -1401,10 +1405,8 @@ def on_depsgraph_update(scene, depsgraph):
             if update.is_updated_geometry or _scale_changed(obj, bridge_id):
                 _schedule_mesh_update(bridge_id, obj)
             else:
-                print(f"[Bridge DBG] depsgraph -> transform '{obj.name}' ({bridge_id})")
                 send_update_transform(obj)
         else:
-            # New object — detect paste duplicate, then create directly (no timer)
             _detect_and_strip_paste_duplicate(obj)
             if not get_bridge_id(obj):
                 send_create(obj)
