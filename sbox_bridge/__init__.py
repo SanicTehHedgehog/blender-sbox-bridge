@@ -59,6 +59,8 @@ classes = (
     panel.SBOX_OT_SyncAll,
     panel.SBOX_OT_SetGrid,
     panel.SBOX_OT_SendToScene,
+    panel.SBOX_OT_RemoveFromScene,
+    panel.SBOX_OT_ClearBridgeID,
     panel.SBOX_OT_ConfirmPendingDeletes,
     panel.SBOX_OT_CancelPendingDeletes,
     panel.SBOX_PT_BridgePanel,

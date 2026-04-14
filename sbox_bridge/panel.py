@@ -180,6 +180,54 @@ class SBOX_OT_SendToScene(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SBOX_OT_RemoveFromScene(bpy.types.Operator):
+    bl_idname = "sbox.bridge_remove_from_scene"
+    bl_label = "Remove from Scene"
+    bl_description = "Delete selected objects from s&box scene but keep them in Blender"
+
+    @classmethod
+    def poll(cls, context):
+        if not connection.is_connected():
+            return False
+        for obj in context.selected_objects:
+            if sync.get_bridge_id(obj):
+                return True
+        return False
+
+    def execute(self, context):
+        count = 0
+        for obj in list(context.selected_objects):
+            bid = sync.get_bridge_id(obj)
+            if bid:
+                sync.send_delete(bid)
+                sync._strip_bridge_props(obj)
+                count += 1
+        self.report({"INFO"}, f"Removed {count} object(s) from s&box scene")
+        return {"FINISHED"}
+
+
+class SBOX_OT_ClearBridgeID(bpy.types.Operator):
+    bl_idname = "sbox.bridge_clear_id"
+    bl_label = "Clear Bridge ID"
+    bl_description = "Strip bridge ID from selected objects so they can be re-synced as new"
+
+    @classmethod
+    def poll(cls, context):
+        for obj in context.selected_objects:
+            if sync.get_bridge_id(obj):
+                return True
+        return False
+
+    def execute(self, context):
+        count = 0
+        for obj in list(context.selected_objects):
+            if sync.get_bridge_id(obj):
+                sync._strip_bridge_props(obj)
+                count += 1
+        self.report({"INFO"}, f"Cleared bridge ID from {count} object(s)")
+        return {"FINISHED"}
+
+
 class SBOX_OT_ConfirmPendingDeletes(bpy.types.Operator):
     bl_idname = "sbox.bridge_confirm_deletes"
     bl_label = "Confirm Deletes"
@@ -402,8 +450,15 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
             row.operator("sbox.bridge_force_resync", icon="RECOVER_LAST", text="Force Resync")
 
             if context.selected_objects:
-                row = box.row()
+                row = box.row(align=True)
                 row.operator("sbox.bridge_send_to_scene", icon="EXPORT")
+                row.operator("sbox.bridge_remove_from_scene", icon="REMOVE", text="")
+
+                # Show Clear ID button if any selected object has a bridge ID
+                has_bid = any(sync.get_bridge_id(obj) for obj in context.selected_objects)
+                if has_bid:
+                    row = box.row()
+                    row.operator("sbox.bridge_clear_id", icon="TRASH")
         except Exception:
             pass
 

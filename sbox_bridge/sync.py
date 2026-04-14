@@ -107,6 +107,25 @@ def _get_scale_factor():
         return 1.0
 
 
+def _should_skip_object(obj):
+    """Return True if this object should NOT be synced to s&box.
+    Filters out hidden objects, cutters, and other non-visual objects."""
+    # Hidden in viewport
+    if obj.hide_viewport or obj.hide_get():
+        return True
+    # Cutter/boolean objects (common in KitOps, HardOps, etc.)
+    name_lower = obj.name.lower()
+    if "cutter" in name_lower or "boolean" in name_lower:
+        return True
+    # Objects in hidden collections
+    try:
+        if not obj.visible_get():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # ── Warnings & Status ────────────────────────────────────────────────────
 
 def add_warning(message):
@@ -154,6 +173,10 @@ def send_create(obj):
 
     # If it already has a unique ID, don't create again
     if get_bridge_id(obj):
+        return
+
+    # Skip hidden/cutter objects
+    if _should_skip_object(obj):
         return
 
     # Strip stale props
@@ -223,9 +246,7 @@ def send_update_transform(obj):
         "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
     }
-    result = connection.send(msg)
-    if not result:
-        print(f"[Bridge] Transform send FAILED for '{obj.name}' ({bridge_id})")
+    connection.send(msg)
 
 
 def send_update_mesh(obj):
@@ -1335,17 +1356,8 @@ def _apply_sbox_transform(obj, msg):
 
 # ── Depsgraph Handler ───────────────────────────────────────────────────
 
-_depsgraph_call_count = 0
-
 def on_depsgraph_update(scene, depsgraph):
     """Called after every depsgraph update. Routes changes to s&box."""
-    global _depsgraph_call_count
-    _depsgraph_call_count += 1
-
-    # Print every 50th call so we know the handler is alive without flooding
-    if _depsgraph_call_count % 50 == 1:
-        print(f"[Bridge DIAG] depsgraph handler called (#{_depsgraph_call_count}, suppress={_suppress_depsgraph}, connected={connection.is_connected()})")
-
     if _suppress_depsgraph:
         return
     if not connection.is_connected():
@@ -1396,6 +1408,10 @@ def on_depsgraph_update(scene, depsgraph):
 
         # Non-mesh — skip
         if obj.type != "MESH":
+            continue
+
+        # Skip hidden/cutter objects
+        if _should_skip_object(obj):
             continue
 
         # Mesh objects
