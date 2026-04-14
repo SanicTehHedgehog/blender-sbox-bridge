@@ -1377,13 +1377,10 @@ def on_depsgraph_update(scene, depsgraph):
                 send_create_light(obj)
             continue
 
-        # Convertible types (curves, surfaces, etc.)
+        # Convertible types (curves, surfaces, etc.) — skip silently.
+        # These should be converted to mesh first (Alt+C / Ctrl+A) before syncing.
+        # Auto-syncing curves produces empty/invisible geometry in s&box.
         if obj.type in CONVERTIBLE_TYPES:
-            if not get_bridge_id(obj):
-                try:
-                    send_create(obj)
-                except Exception:
-                    pass
             continue
 
         # Non-mesh — skip
@@ -1506,10 +1503,10 @@ def _check_duplicates():
     if not connection.is_connected():
         return
 
-    # Strip bridge IDs from non-syncable types
+    # Strip bridge IDs from non-syncable types (only MESH and LIGHT should have them)
     for obj in list(bpy.data.objects):
         bid = obj.get("sbox_bridge_id")
-        if bid and obj.type not in SYNCABLE_TYPES and obj.type not in CONVERTIBLE_TYPES:
+        if bid and obj.type not in SYNCABLE_TYPES:
             _strip_bridge_props(obj)
             continue
 
