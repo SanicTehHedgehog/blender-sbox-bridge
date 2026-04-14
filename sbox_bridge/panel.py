@@ -100,12 +100,27 @@ class SBOX_OT_ForceResync(bpy.types.Operator):
         return connection.is_connected()
 
     def execute(self, context):
+        # Step 1: Delete all existing bridge objects from s&box
+        old_ids = []
+        for obj in list(bpy.data.objects):
+            if obj.get("sbox_scene_id") or obj.get("sbox_type"):
+                continue
+            if obj.type in ("MESH", "LIGHT"):
+                bid = sync.get_bridge_id(obj)
+                if bid:
+                    old_ids.append(bid)
+
+        for bid in old_ids:
+            sync.send_delete(bid)
+
+        # Step 2: Strip all bridge properties from Blender objects
         count = 0
         for obj in list(bpy.data.objects):
             if obj.get("sbox_scene_id") or obj.get("sbox_type"):
                 continue
             if obj.type in ("MESH", "LIGHT"):
-                for key in ["sbox_bridge_id", "_remote_update_time"]:
+                for key in ["sbox_bridge_id", "sbox_bridge_name", "sbox_bridge_hash",
+                             "sbox_bridge_status", "sbox_bridge_last_sync", "_remote_update_time"]:
                     if key in obj:
                         del obj[key]
                 count += 1
@@ -114,9 +129,13 @@ class SBOX_OT_ForceResync(bpy.types.Operator):
         sync._last_scale.clear()
         sync._last_write_seq.clear()
         sync._material_hash_cache.clear()
+        sync._pending_deletes.clear()
 
+        # Step 3: Re-create all objects with fresh IDs
         for obj in list(bpy.data.objects):
             if obj.get("sbox_scene_id") or obj.get("sbox_type"):
+                continue
+            if sync._should_skip_object(obj):
                 continue
             if obj.type == "MESH" and not sync.get_bridge_id(obj):
                 sync.send_create(obj)
@@ -124,7 +143,7 @@ class SBOX_OT_ForceResync(bpy.types.Operator):
                 if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
                     sync.send_create_light(obj)
 
-        sync.send_sync()
+        # Don't call send_sync() — it would re-import old s&box objects as duplicates
         self.report({"INFO"}, f"Force resynced {count} objects")
         return {"FINISHED"}
 
