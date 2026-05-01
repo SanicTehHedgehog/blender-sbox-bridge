@@ -1652,6 +1652,30 @@ def on_depsgraph_update(scene, depsgraph):
     now = time.time()
 
     for update in depsgraph.updates:
+        # Material datablock updates: editing a material's properties (color
+        # slider, texture node link, image swap) doesn't fire an Object update
+        # in Blender's depsgraph — only the Material datablock fires. Walk
+        # bpy.data.objects, find every mesh that has this material in any
+        # slot, and queue a mesh re-sync. Without this, the user has to nudge
+        # geometry to push material edits through.
+        if isinstance(update.id, bpy.types.Material):
+            try:
+                mat = update.id.original
+            except Exception:
+                mat = update.id
+            for using_obj in bpy.data.objects:
+                if using_obj.type != "MESH" or using_obj.data is None:
+                    continue
+                if not any(slot is mat for slot in using_obj.data.materials):
+                    continue
+                if _should_skip_object(using_obj):
+                    continue
+                bid = get_bridge_id(using_obj)
+                if bid:
+                    set_sync_status(using_obj, "modified")
+                    _schedule_mesh_update(bid, using_obj)
+            continue
+
         # Accept Object updates only
         if not isinstance(update.id, bpy.types.Object):
             continue
@@ -1711,7 +1735,11 @@ def on_depsgraph_update(scene, depsgraph):
             eval_scale = tuple(round(s, 4) for s in update.id.scale)
             is_geo = update.is_updated_geometry
             is_scale = _scale_changed_with(bridge_id, eval_scale)
-            if is_geo or is_scale:
+            # is_updated_shading fires on material slot reassignment and on
+            # active-UV-layer swaps — both need a full mesh re-sync, not just
+            # a transform update.
+            is_shading = getattr(update, "is_updated_shading", False)
+            if is_geo or is_scale or is_shading:
                 set_sync_status(obj, "modified")
                 _schedule_mesh_update(bridge_id, obj)
             else:
