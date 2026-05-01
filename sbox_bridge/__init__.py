@@ -6,7 +6,7 @@ Features sync direction controls, hierarchy mapping, status indicators, and geom
 bl_info = {
     "name": "s&box Bridge",
     "author": "SanicTehHedgehog",
-    "version": (3, 2, 0),
+    "version": (3, 3, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > s&box",
     "description": "Bidirectional scene sync with s&box game engine",
