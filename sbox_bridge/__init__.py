@@ -99,6 +99,10 @@ def register():
     bpy.types.Scene.sbox_bridge = bpy.props.PointerProperty(type=SboxBridgeSettings)
     if sync.on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(sync.on_depsgraph_update)
+    if sync.on_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(sync.on_undo_post)
+    if sync.on_undo_post not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(sync.on_undo_post)
     print("[s&box Bridge v2] Addon registered.")
 
 
@@ -107,6 +111,10 @@ def unregister():
     sync.stop_timer()
     if sync.on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(sync.on_depsgraph_update)
+    if sync.on_undo_post in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(sync.on_undo_post)
+    if sync.on_undo_post in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(sync.on_undo_post)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     if hasattr(bpy.types.Scene, "sbox_bridge"):

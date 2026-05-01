@@ -93,11 +93,39 @@ class SBOX_OT_SyncAll(bpy.types.Operator):
 class SBOX_OT_ForceResync(bpy.types.Operator):
     bl_idname = "sbox.bridge_force_resync"
     bl_label = "Force Resync"
-    bl_description = "Strip all bridge IDs and re-create everything from scratch"
+    bl_description = (
+        "DESTRUCTIVE: deletes every bridge object on the s&box side and "
+        "re-creates them from Blender. Any custom s&box-side materials "
+        "(water shaders, manually-applied vmats) and any geometry edits "
+        "made in s&box will be lost"
+    )
 
     @classmethod
     def poll(cls, context):
         return connection.is_connected()
+
+    def invoke(self, context, event):
+        # Confirmation dialog. Force Resync is destructive — it deletes every
+        # bridge object on the s&box side before re-creating, so any custom
+        # materials or geometry authored in s&box are gone. Make the user
+        # acknowledge before proceeding.
+        return context.window_manager.invoke_confirm(
+            self,
+            event,
+            message=(
+                "Force Resync will DELETE every bridge object on the s&box side "
+                "and re-create them from Blender.\n\n"
+                "You will lose:\n"
+                "  • Any custom materials applied in s&box (water shaders, "
+                "manually-set vmats)\n"
+                "  • Any geometry edits made in s&box on bridge objects\n"
+                "  • All bridge object IDs (re-issued on recreate)\n\n"
+                "Continue?"
+            ),
+            title="Force Resync — destructive",
+            icon='ERROR',
+            confirm_text="Force Resync",
+        )
 
     def execute(self, context):
         # Step 1: Delete all existing bridge objects from s&box

@@ -85,21 +85,70 @@ def sbox_to_blender_pos(sx, sy, sz):
     return (-sy, sx, sz)
 
 
+def _world_decompose(obj):
+    """Decompose obj.matrix_world into (world_translation, world_euler, world_scale).
+    Used so parented children send correct world transforms instead of local-to-parent."""
+    m = obj.matrix_world
+    return m.to_translation(), m.to_euler(), m.to_scale()
+
+
 # ── Bridge ID Helpers ────────────────────────────────────────────────────
 
+# Bridge ID is mirrored on obj.data so it survives undo/redo: Blender's undo
+# stack restores mesh data more reliably than object custom-prop edits, and the
+# undo_post handler reseeds the obj-side ID from the data side.
+
 def get_bridge_id(obj):
-    return obj.get("sbox_bridge_id")
+    bid = obj.get("sbox_bridge_id")
+    if bid:
+        return bid
+    if obj.data is not None:
+        return obj.data.get("sbox_bridge_id")
+    return None
 
 
 def set_bridge_id(obj, bridge_id):
     obj["sbox_bridge_id"] = bridge_id
+    if obj.data is not None:
+        obj.data["sbox_bridge_id"] = bridge_id
+
+
+def clear_bridge_id(obj):
+    """Strip the bridge ID from obj and (if not shared) obj.data."""
+    if "sbox_bridge_id" in obj:
+        del obj["sbox_bridge_id"]
+    # Only clear from data if no other object shares it — otherwise we'd
+    # nuke another bridged linked-duplicate's recovery anchor.
+    data = obj.data
+    if data is not None and "sbox_bridge_id" in data and data.users <= 1:
+        del data["sbox_bridge_id"]
 
 
 def find_by_bridge_id(bridge_id):
     for obj in bpy.data.objects:
-        if obj.get("sbox_bridge_id") == bridge_id:
+        if get_bridge_id(obj) == bridge_id:
             return obj
     return None
+
+
+def on_undo_post(scene):
+    """After undo/redo, re-seed obj-side bridge IDs from mesh-data side.
+
+    Custom props on Object are not reliably restored by Blender's undo stack,
+    but mesh-data props are. If we find an object whose mesh data still carries
+    a bridge ID but the obj does not, restore it. This is what kills the
+    ghost-duplicate failure mode (lost ID → looks like a new object → s&box
+    creates a duplicate or the hash false-matches an unrelated mesh).
+    """
+    for obj in bpy.data.objects:
+        if obj.get("sbox_bridge_id"):
+            continue
+        data = obj.data
+        if data is None:
+            continue
+        mesh_id = data.get("sbox_bridge_id")
+        if mesh_id:
+            obj["sbox_bridge_id"] = mesh_id
 
 
 def _get_scale_factor():
@@ -282,13 +331,12 @@ def send_create(obj):
     global _blender_seq
 
     # Detect paste duplicate: another object has the same bridgeId
-    bid = obj.get("sbox_bridge_id")
+    bid = get_bridge_id(obj)
     if bid:
         for other in bpy.data.objects:
-            if other != obj and other.get("sbox_bridge_id") == bid:
+            if other != obj and get_bridge_id(other) == bid:
                 # This is a pasted copy — strip the stale ID
-                if "sbox_bridge_id" in obj:
-                    del obj["sbox_bridge_id"]
+                clear_bridge_id(obj)
                 bid = None
                 break
 
@@ -312,7 +360,8 @@ def send_create(obj):
             print(f"[Bridge] Create skipped '{obj.name}': no mesh data")
             return
 
-        px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
+        wp = obj.matrix_world.to_translation()
+        px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
         idem_key = f"{obj.name}_{getattr(obj, 'session_uid', id(obj))}"
         geo_hash = geometry_hash(obj)
         hierarchy = get_collection_path(obj)
@@ -364,7 +413,8 @@ def send_update_transform(obj):
     _last_write_seq[bridge_id] = _blender_seq
 
     sf = _get_scale_factor()
-    px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
+    wp = obj.matrix_world.to_translation()
+    px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
 
     msg = {
         "type": "update_transform",
@@ -405,7 +455,8 @@ def send_update_mesh(obj):
         set_sync_status(obj, "synced")
         return
 
-    px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
+    wp = obj.matrix_world.to_translation()
+    px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
 
     _blender_seq += 1
     _last_write_seq[bridge_id] = _blender_seq
@@ -485,7 +536,8 @@ def _send_chunked_mesh(obj, bridge_id, mesh_data):
             try:
                 o = bpy.data.objects.get(s["obj_name"])
                 if o:
-                    px, py, pz = blender_to_sbox_pos(o.location.x, o.location.y, o.location.z)
+                    wp = o.matrix_world.to_translation()
+                    px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
                     pos = {"x": px * sf, "y": py * sf, "z": pz * sf}
                     rot = _rotation_to_sbox(o)
                 else:
@@ -581,7 +633,8 @@ def send_create_light(obj):
     sbox_light_type = light_type_map.get(obj.data.type, "point")
 
     sf = _get_scale_factor()
-    px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
+    wp = obj.matrix_world.to_translation()
+    px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
     props = _extract_light_properties(obj)
     idem_key = f"light_{obj.name}_{getattr(obj, 'session_uid', id(obj))}"
 
@@ -622,7 +675,8 @@ def send_update_light(obj):
     _last_transform_send[bridge_id] = now
 
     sf = _get_scale_factor()
-    px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
+    wp = obj.matrix_world.to_translation()
+    px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
     props = _extract_light_properties(obj)
 
     _blender_seq += 1
@@ -654,7 +708,8 @@ def send_scene_transform(obj):
 
     global _blender_seq
     sf = _get_scale_factor()
-    px, py, pz = blender_to_sbox_pos(obj.location.x, obj.location.y, obj.location.z)
+    wp = obj.matrix_world.to_translation()
+    px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
 
     _blender_seq += 1
     msg = {
@@ -1208,23 +1263,17 @@ def _extract_mesh_data(obj, sf):
         if mesh is None:
             return None
 
-        # Use the object's world matrix to transform vertices to world space.
-        # This correctly handles scale, rotation, and location in one step,
-        # and avoids the double-scale bug where scale gets re-applied on each sync.
-        # We then subtract the object's world position since s&box applies position separately.
-        world_matrix = obj.matrix_world
-        obj_pos = obj.matrix_world.translation
+        # Bake only world-cumulative scale into vertices. World rotation and
+        # world position are sent separately and applied by s&box. Baking
+        # rotation here would double-rotate (s&box re-applies WorldRotation);
+        # baking translation would mis-place parented children.
+        ws = obj.matrix_world.to_scale()
 
         vertices = []
         for v in mesh.vertices:
-            # Transform vertex to world space
-            world_co = world_matrix @ v.co
-            # Subtract object origin (position is sent separately)
-            local_world = world_co - obj_pos
-            # Apply scale factor and convert coordinates
-            bx = local_world.x * sf
-            by = local_world.y * sf
-            bz = local_world.z * sf
+            bx = v.co.x * ws.x * sf
+            by = v.co.y * ws.y * sf
+            bz = v.co.z * ws.z * sf
             cvt = blender_to_sbox_pos(bx, by, bz)
             vertices.extend(0.0 if (math.isnan(c) or math.isinf(c)) else c for c in cvt)
 
@@ -1401,7 +1450,16 @@ def _generate_vmat_and_copy_textures(mat_data):
     os.makedirs(bridge_dir, exist_ok=True)
 
     def copy_tex(abs_path, suffix):
-        if not abs_path or not os.path.isfile(abs_path):
+        # Bare empty/None means the BSDF input has no texture — silent is correct.
+        if not abs_path:
+            return None
+        # A path was specified but doesn't resolve. Surface this — most common
+        # cause of "all surfaces are dev grid": image was loaded then file moved,
+        # or image is packed into the .blend with no external file on disk.
+        if not os.path.isfile(abs_path):
+            add_warning(
+                f"Texture missing for material '{safe_name}' ({suffix}): {abs_path}"
+            )
             return None
         ext = os.path.splitext(abs_path)[1]
         dest_name = f"{safe_name}_{suffix}{ext}"
@@ -1410,7 +1468,9 @@ def _generate_vmat_and_copy_textures(mat_data):
             shutil.copy2(abs_path, dest_abs)
             return f"materials/blender_bridge/{dest_name}"
         except Exception as e:
-            print(f"[Bridge] Texture copy failed: {e}")
+            add_warning(
+                f"Texture copy failed for '{safe_name}' ({suffix}): {e}"
+            )
             return None
 
     color_ref = copy_tex(mat_data.get("baseColorTexture"), "color")
@@ -1507,10 +1567,11 @@ def _extract_light_properties(obj):
 # ── Transform Helpers ────────────────────────────────────────────────────
 
 def _rotation_to_sbox(obj):
+    we = obj.matrix_world.to_euler()
     return {
-        "pitch": math.degrees(obj.rotation_euler.x),
-        "yaw": math.degrees(obj.rotation_euler.z),
-        "roll": math.degrees(obj.rotation_euler.y),
+        "pitch": math.degrees(we.x),
+        "yaw": math.degrees(we.z),
+        "roll": math.degrees(we.y),
     }
 
 
@@ -1674,13 +1735,12 @@ def _schedule_mesh_update(bridge_id, obj):
 
 def _detect_and_strip_paste_duplicate(obj):
     """Detect if an object was pasted and inherited a stale bridge ID."""
-    bid = obj.get("sbox_bridge_id")
+    bid = get_bridge_id(obj)
     if not bid:
         return
     for other in bpy.data.objects:
-        if other != obj and other.get("sbox_bridge_id") == bid:
-            if "sbox_bridge_id" in obj:
-                del obj["sbox_bridge_id"]
+        if other != obj and get_bridge_id(other) == bid:
+            clear_bridge_id(obj)
             if "_remote_update_time" in obj:
                 del obj["_remote_update_time"]
             return
@@ -1742,12 +1802,12 @@ def _check_duplicates():
     # Use _strip_bridge_props which also removes from _last_known_bridge_ids
     # so _check_deletions won't send delete messages for these
     for obj in list(bpy.data.objects):
-        bid = obj.get("sbox_bridge_id")
+        bid = get_bridge_id(obj)
         if bid and obj.type not in SYNCABLE_TYPES:
             # Silently strip — don't trigger deletes for curves/armatures/etc
-            for key in ["sbox_bridge_id", "_remote_update_time"]:
-                if key in obj:
-                    del obj[key]
+            clear_bridge_id(obj)
+            if "_remote_update_time" in obj:
+                del obj["_remote_update_time"]
             _last_known_bridge_ids.discard(bid)
             _last_write_seq.pop(bid, None)
             # Also remove from pending deletes if it got added
@@ -1836,10 +1896,10 @@ def _confirm_pending_deletes():
 
 def _strip_bridge_props(obj):
     """Remove all bridge-related custom properties from an object."""
-    bid = obj.get("sbox_bridge_id")
-    for key in ["sbox_bridge_id", "_remote_update_time"]:
-        if key in obj:
-            del obj[key]
+    bid = get_bridge_id(obj)
+    clear_bridge_id(obj)
+    if "_remote_update_time" in obj:
+        del obj["_remote_update_time"]
     if bid:
         _last_known_bridge_ids.discard(bid)
         _last_write_seq.pop(bid, None)
