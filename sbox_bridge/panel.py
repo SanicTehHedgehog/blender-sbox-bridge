@@ -141,13 +141,20 @@ class SBOX_OT_ForceResync(bpy.types.Operator):
         for bid in old_ids:
             sync.send_delete(bid)
 
-        # Step 2: Strip all bridge properties from Blender objects
+        # Step 2: Strip all bridge properties from Blender objects.
+        # Use clear_bridge_id() so we strip the data-side mirror too — without
+        # this, get_bridge_id() falls through to obj.data and returns the
+        # stale ID, which makes step 3's create-branch a no-op. The result
+        # is s&box ends up empty and Blender keeps zombie IDs, then the next
+        # send_sync detects the missing s&box objects and deletes the Blender
+        # ones to "match" — total wipe in both editors.
         count = 0
         for obj in list(bpy.data.objects):
             if obj.get("sbox_scene_id") or obj.get("sbox_type"):
                 continue
             if obj.type in ("MESH", "LIGHT"):
-                for key in ["sbox_bridge_id", "sbox_bridge_name", "sbox_bridge_hash",
+                sync.clear_bridge_id(obj)
+                for key in ["sbox_bridge_name", "sbox_bridge_hash",
                              "sbox_bridge_status", "sbox_bridge_last_sync", "_remote_update_time"]:
                     if key in obj:
                         del obj[key]
