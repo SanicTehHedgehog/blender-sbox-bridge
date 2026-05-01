@@ -180,9 +180,17 @@ def _should_skip_object(obj):
 # ── Geometry Hash & Sync Status ──────────────────────────────────────────
 
 def geometry_hash(obj):
-    """Fast hash of vertex/face data + scale for change detection.
-    Returns a 12-char hex string, or empty string if no mesh.
-    Includes object scale since we bake it into world-space vertices."""
+    """Hash of everything we send on the wire, so the dispatcher's hash gate
+    invalidates when any of it changes. Returns a 12-char hex string, or
+    empty string if no mesh.
+
+    Includes:
+      - vertex positions
+      - face vertex indices
+      - object scale (baked into world-space vertices)
+      - material slot names (so applying a material in Blender re-syncs)
+      - active UV layer coords (so editing UVs in the UV editor re-syncs)
+    """
     import struct
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -192,11 +200,19 @@ def geometry_hash(obj):
             return ""
         verts = [c for v in mesh.vertices for c in v.co]
         faces = [vi for p in mesh.polygons for vi in p.vertices]
-        # Include scale in hash — scale changes affect the world-space vertices we send
         scale = [round(s, 4) for s in obj.scale]
+        mat_names = "|".join(m.name if m else "" for m in mesh.materials)
+        uv_layer = mesh.uv_layers.active
+        uv_floats = []
+        if uv_layer:
+            for d in uv_layer.data:
+                uv_floats.append(d.uv.x)
+                uv_floats.append(d.uv.y)
         data = (struct.pack(f'{len(verts)}f', *verts)
                 + struct.pack(f'{len(faces)}i', *faces)
-                + struct.pack('3f', *scale))
+                + struct.pack('3f', *scale)
+                + mat_names.encode('utf-8')
+                + struct.pack(f'{len(uv_floats)}f', *uv_floats))
         eval_obj.to_mesh_clear()
         return hashlib.md5(data).hexdigest()[:12]
     except Exception:
@@ -1279,11 +1295,23 @@ def _extract_mesh_data(obj, sf):
 
         faces = []
         face_materials = []
+        # Per-loop UVs from the active UV layer. Flat [u, v, u, v, ...] aligned
+        # with face vertex order: face N's UVs immediately follow face N-1's.
+        # V is flipped (1 - v) because Blender uses V=0 at bottom while Source
+        # 2 / s&box conventionally treats V=0 at top — without the flip,
+        # textures appear vertically inverted.
+        uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
+        face_uvs = [] if uv_layer else None
         for poly in mesh.polygons:
             faces.append(len(poly.vertices))
             for vi in poly.vertices:
                 faces.append(vi)
             face_materials.append(poly.material_index)
+            if uv_layer:
+                for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
+                    uv = uv_layer[li].uv
+                    face_uvs.append(uv.x)
+                    face_uvs.append(1.0 - uv.y)
 
         materials = _extract_materials(obj)
         eval_obj.to_mesh_clear()
@@ -1292,6 +1320,8 @@ def _extract_mesh_data(obj, sf):
         if materials:
             result["materials"] = materials
             result["faceMaterials"] = face_materials
+        if face_uvs is not None:
+            result["faceUVs"] = face_uvs
         return result
     except Exception as e:
         print(f"[Bridge] Mesh extraction error: {e}")
