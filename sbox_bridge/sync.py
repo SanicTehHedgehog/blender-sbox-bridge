@@ -85,6 +85,29 @@ def sbox_to_blender_pos(sx, sy, sz):
     return (-sy, sx, sz)
 
 
+def _snap_source(v):
+    """Round a source-unit value to the bridge grid_size, if configured.
+    Bridge-side grid snap — the source of truth for grid alignment. Blender's
+    own snap is unreliable for fractional steps in 4.2+ (Absolute Grid Snap
+    was removed; INCREMENT has a 1-BU floor at typical zooms), so the wire
+    enforces alignment regardless of viewport state. With grid_size=1 this
+    is a near no-op for any non-trivial position."""
+    try:
+        gs = bpy.context.scene.sbox_bridge.grid_size
+        if gs and gs > 0:
+            return round(v / gs) * gs
+    except Exception:
+        pass
+    return v
+
+
+def _wire_position(obj, sf):
+    """World position of obj, in s&box source units, snapped to grid_size."""
+    wp = obj.matrix_world.to_translation()
+    bx, by, bz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
+    return (_snap_source(bx * sf), _snap_source(by * sf), _snap_source(bz * sf))
+
+
 def _world_decompose(obj):
     """Decompose obj.matrix_world into (world_translation, world_euler, world_scale).
     Used so parented children send correct world transforms instead of local-to-parent."""
@@ -393,7 +416,7 @@ def send_create(obj):
             "seq": _blender_seq,
             "ack": _last_sbox_seq_processed,
             "name": obj.name,
-            "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
+            "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
             "rotation": _rotation_to_sbox(obj),
             "meshData": mesh_data,
             "idempotencyKey": idem_key,
@@ -442,7 +465,7 @@ def send_update_transform(obj):
         "seq": _blender_seq,
         "ack": _last_sbox_seq_processed,
         "bridgeId": bridge_id,
-        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
+        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
         "rotation": _rotation_to_sbox(obj),
     }
     connection.send(msg)
@@ -488,7 +511,7 @@ def send_update_mesh(obj):
         "ack": _last_sbox_seq_processed,
         "bridgeId": bridge_id,
         "name": obj.name,
-        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
+        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
         "rotation": _rotation_to_sbox(obj),
         "meshData": mesh_data,
         "geometryHash": geo_hash,
@@ -559,7 +582,7 @@ def _send_chunked_mesh(obj, bridge_id, mesh_data):
                 if o:
                     wp = o.matrix_world.to_translation()
                     px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
-                    pos = {"x": px * sf, "y": py * sf, "z": pz * sf}
+                    pos = {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)}
                     rot = _rotation_to_sbox(o)
                 else:
                     pos = {"x": 0, "y": 0, "z": 0}
@@ -666,7 +689,7 @@ def send_create_light(obj):
         "ack": _last_sbox_seq_processed,
         "name": obj.name,
         "lightType": sbox_light_type,
-        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
+        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
         "rotation": _rotation_to_sbox(obj),
         "properties": props,
         "idempotencyKey": idem_key,
@@ -708,7 +731,7 @@ def send_update_light(obj):
         "seq": _blender_seq,
         "ack": _last_sbox_seq_processed,
         "bridgeId": bridge_id,
-        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
+        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
         "rotation": _rotation_to_sbox(obj),
         "properties": props,
     }
@@ -738,7 +761,7 @@ def send_scene_transform(obj):
         "seq": _blender_seq,
         "ack": _last_sbox_seq_processed,
         "sceneId": scene_id,
-        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
+        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
         "rotation": _rotation_to_sbox(obj),
     }
     connection.send(msg)

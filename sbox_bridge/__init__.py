@@ -6,7 +6,7 @@ Features sync direction controls, hierarchy mapping, status indicators, and geom
 bl_info = {
     "name": "s&box Bridge",
     "author": "SanicTehHedgehog",
-    "version": (3, 4, 2),
+    "version": (3, 5, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > s&box",
     "description": "Bidirectional scene sync with s&box game engine",
@@ -114,7 +114,6 @@ classes = (
     panel.SBOX_OT_DeleteBridgeMaterial,
     panel.SBOX_OT_OpenBridgeMaterialFolder,
     panel.SBOX_OT_SyncAll,
-    panel.SBOX_OT_SetGrid,
     panel.SBOX_OT_SendToScene,
     panel.SBOX_OT_ApplyMaterial,
     panel.SBOX_OT_RemoveFromScene,

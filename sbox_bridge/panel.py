@@ -25,6 +25,42 @@ class SBOX_OT_Connect(bpy.types.Operator):
         if success:
             settings.is_connected = True
             sync.start_timer()
+            # Auto-detect Assets folder. Server walks up from the active scene's
+            # resource path to find the project's Assets folder. Only writes the
+            # setting if the user hasn't already set one — manual override wins.
+            try:
+                resp = connection.send_and_receive({"type": "get_project_info"})
+                if resp and resp.get("assetsDir"):
+                    server_path = resp["assetsDir"]
+                    if not settings.project_assets_path:
+                        settings.project_assets_path = server_path
+                        sync.log_activity(f"Auto-detected Assets path: {server_path}")
+                    elif bpy.path.abspath(settings.project_assets_path).rstrip("\\/") != server_path.rstrip("\\/"):
+                        sync.log_activity(
+                            f"Server suggests Assets path: {server_path} "
+                            f"(keeping user-set: {settings.project_assets_path})"
+                        )
+                elif resp:
+                    diag = resp.get("diag") or {}
+                    # Print full diagnostic so we can see exactly where discovery failed.
+                    print(f"[s&box Bridge] Auto-detect failed. Server diag: {diag}")
+                    if diag.get("discoveryError"):
+                        sync.log_activity(f"Auto-detect error: {diag['discoveryError']}")
+                    elif diag.get("sessionState") != "active":
+                        sync.log_activity(f"Auto-detect: no active editor session (state={diag.get('sessionState')})")
+                    elif diag.get("sceneState") != "active":
+                        sync.log_activity("Auto-detect: editor session has no active scene")
+                    elif not diag.get("sceneResourcePath"):
+                        sync.log_activity("Auto-detect: scene has no resource path (unsaved?)")
+                    elif not diag.get("fullScenePath"):
+                        sync.log_activity(f"Auto-detect: scene path '{diag.get('sceneResourcePath')}' didn't resolve")
+                    else:
+                        sync.log_activity(
+                            f"Auto-detect: walked up from {diag.get('fullScenePath')}, "
+                            f"no Assets folder found (first checked: {diag.get('firstAssetsCandidate')})"
+                        )
+            except Exception as e:
+                print(f"[s&box Bridge] get_project_info failed: {e}")
             # Send unsynced Blender objects first, then request sync from s&box
             for obj in list(bpy.data.objects):
                 if obj.get("sbox_scene_id") or obj.get("sbox_type"):
@@ -422,23 +458,6 @@ class SBOX_OT_CancelPendingDeletes(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class SBOX_OT_SetGrid(bpy.types.Operator):
-    bl_idname = "sbox.set_grid"
-    bl_label = "Set Grid"
-    bl_description = "Set Blender grid to match s&box grid size"
-
-    grid_size: bpy.props.IntProperty(name="Grid Size", default=16)
-
-    def execute(self, context):
-        try:
-            _apply_sbox_grid(context, self.grid_size)
-            self.report({"INFO"}, f"Grid set to {self.grid_size} units")
-        except Exception as e:
-            self.report({"WARNING"}, f"Grid error: {e}")
-            traceback.print_exc()
-        return {"FINISHED"}
-
-
 class SBOX_OT_DeleteBridgeMaterial(bpy.types.Operator):
     bl_idname = "sbox.delete_bridge_material"
     bl_label = "Delete Material"
@@ -496,48 +515,6 @@ class SBOX_OT_OpenBridgeMaterialFolder(bpy.types.Operator):
         return {"FINISHED"}
 
 
-# ── Grid Helper ──────────────────────────────────────────────────────────
-
-def _apply_sbox_grid(context, grid_size):
-    """Set Blender grid to match s&box grid size."""
-    try:
-        sf = context.scene.sbox_bridge.scale_factor if hasattr(context.scene, "sbox_bridge") else 1.0
-    except Exception:
-        sf = 1.0
-    inv_sf = 1.0 / sf if sf != 0 else 1.0
-
-    try:
-        context.scene.unit_settings.system = 'NONE'
-        context.scene.unit_settings.scale_length = 1.0
-    except Exception:
-        pass
-
-    try:
-        context.scene.tool_settings.snap_elements = {'INCREMENT'}
-        context.scene.tool_settings.use_snap = True
-    except Exception:
-        pass
-
-    blender_grid = grid_size * inv_sf
-
-    try:
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    for space in area.spaces:
-                        if space.type == 'VIEW_3D':
-                            space.overlay.grid_scale = blender_grid
-                            space.overlay.grid_subdivisions = 1
-    except Exception:
-        pass
-
-    try:
-        if hasattr(context.scene, "sbox_bridge"):
-            context.scene.sbox_bridge.grid_size = grid_size
-    except Exception:
-        pass
-
-
 # ── Main Panel ───────────────────────────────────────────────────────────
 
 class SBOX_PT_BridgePanel(bpy.types.Panel):
@@ -580,21 +557,6 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
 
         layout.separator()
 
-        # ── Grid ──────────────────────────────────────────────────
-        try:
-            box = layout.box()
-            box.label(text="Grid Size", icon="SNAP_GRID")
-            row = box.row(align=True)
-            for size in [2, 4, 8, 16, 32]:
-                op = row.operator("sbox.set_grid", text=str(size))
-                op.grid_size = size
-            if hasattr(context.scene, "sbox_bridge"):
-                box.label(text=f"s&box Grid: {context.scene.sbox_bridge.grid_size}")
-        except Exception:
-            pass
-
-        layout.separator()
-
         # ── Sync ──────────────────────────────────────────────────
         try:
             box = layout.box()
@@ -603,6 +565,7 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
             box.prop(settings, "sync_mode")
             box.prop(settings, "auto_sync")
             box.prop(settings, "scale_factor")
+            box.prop(settings, "grid_size")
             box.prop(settings, "project_assets_path")
             box.prop(settings, "auto_reconnect")
 
