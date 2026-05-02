@@ -6,7 +6,7 @@ Features sync direction controls, hierarchy mapping, status indicators, and geom
 bl_info = {
     "name": "s&box Bridge",
     "author": "SanicTehHedgehog",
-    "version": (3, 4, 1),
+    "version": (3, 4, 2),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > s&box",
     "description": "Bidirectional scene sync with s&box game engine",
@@ -17,6 +17,34 @@ import bpy
 from . import connection
 from . import sync
 from . import panel
+
+
+def _on_scale_factor_changed(self, context):
+    """Project scale_factor changed. The factor is baked into vertex positions
+    on the wire, so every existing bridge object now has stale geometry on the
+    s&box side. Clear all stored geometry hashes and queue a deferred force-
+    resync of every bridge object. Deferred via timer because property-update
+    callbacks run mid-write — we can't safely walk bpy.data inline."""
+    def deferred():
+        if not connection.is_connected():
+            return None
+        for obj in bpy.data.objects:
+            if "sbox_bridge_hash" in obj:
+                del obj["sbox_bridge_hash"]
+            if obj.data is not None and "sbox_bridge_hash" in obj.data:
+                del obj.data["sbox_bridge_hash"]
+        count = 0
+        for obj in list(bpy.data.objects):
+            if obj.type == "MESH" and not sync._should_skip_object(obj):
+                if sync.get_bridge_id(obj):
+                    sync.send_update_mesh(obj)
+                    count += 1
+            elif obj.type == "LIGHT" and sync.get_bridge_id(obj):
+                sync.send_update_light(obj)
+                count += 1
+        sync.log_activity(f"Project scale -> {self.scale_factor:.2f}, resynced {count} bridge object(s)")
+        return None
+    bpy.app.timers.register(deferred, first_interval=0.1)
 
 
 # ── Addon Properties ───────────────────────────────────────────────���──────
@@ -32,8 +60,13 @@ class SboxBridgeSettings(bpy.types.PropertyGroup):
     )
     is_connected: bpy.props.BoolProperty(name="Connected", default=False)
     scale_factor: bpy.props.FloatProperty(
-        name="Scale Factor", default=1.0, min=0.001, max=10000.0,
-        description="Blender to s&box scale multiplier. 1.0 = direct 1:1 unit mapping",
+        name="Scale Factor", default=16.0, min=0.001, max=10000.0,
+        description=(
+            "Blender unit to s&box source-unit multiplier. 16 is the idiomatic "
+            "default (1 Blender unit = 16 source units). Changing this re-bakes "
+            "every bridged mesh's vertices and triggers a full resync."
+        ),
+        update=_on_scale_factor_changed,
     )
     auto_sync: bpy.props.BoolProperty(
         name="Auto Sync", default=True,
@@ -83,6 +116,7 @@ classes = (
     panel.SBOX_OT_SyncAll,
     panel.SBOX_OT_SetGrid,
     panel.SBOX_OT_SendToScene,
+    panel.SBOX_OT_ApplyMaterial,
     panel.SBOX_OT_RemoveFromScene,
     panel.SBOX_OT_ClearBridgeID,
     panel.SBOX_OT_SendChildren,

@@ -234,6 +234,59 @@ class SBOX_OT_SendToScene(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SBOX_OT_ApplyMaterial(bpy.types.Operator):
+    """Force-resync materials, UVs, and geometry for selected mesh objects.
+    Manual escape hatch when Blender's depsgraph silently misses a material
+    or UV edit (which happens — slot reassignment, image swap, or material
+    pointer changes don't always fire the right update flags). This bypasses
+    the geometry-hash gate and always pushes."""
+    bl_idname = "sbox.bridge_apply_material"
+    bl_label = "Apply Material"
+    bl_description = (
+        "Force-resync materials and UVs for selected mesh objects, bypassing "
+        "the change-detection hash. Use when an applied material isn't "
+        "showing up in s&box despite syncing"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        if not connection.is_connected():
+            return False
+        return any(o.type == "MESH" for o in context.selected_objects)
+
+    def execute(self, context):
+        synced = 0
+        for obj in context.selected_objects:
+            if obj.type != "MESH":
+                continue
+            if obj.get("sbox_scene_id") or obj.get("sbox_type"):
+                continue
+            if sync._should_skip_object(obj):
+                continue
+            bid = sync.get_bridge_id(obj)
+            if not bid:
+                continue
+            # Invalidate stored hash so send_update_mesh can't gate this out.
+            if "sbox_bridge_hash" in obj:
+                del obj["sbox_bridge_hash"]
+            if obj.data is not None and "sbox_bridge_hash" in obj.data:
+                del obj.data["sbox_bridge_hash"]
+            # Drop cached vmatPaths for this object's materials so the
+            # bridge regenerates them from current Blender state instead of
+            # reusing a stale pointer.
+            if obj.data and obj.data.materials:
+                for slot in obj.data.materials:
+                    if slot:
+                        sync._material_hash_cache.pop(slot.name, None)
+            sync.send_update_mesh(obj)
+            synced += 1
+        if synced:
+            self.report({"INFO"}, f"Force-synced materials on {synced} object(s)")
+        else:
+            self.report({"WARNING"}, "No bridged mesh objects in selection")
+        return {"FINISHED"}
+
+
 class SBOX_OT_RemoveFromScene(bpy.types.Operator):
     bl_idname = "sbox.bridge_remove_from_scene"
     bl_label = "Remove from Scene"
@@ -564,8 +617,9 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
 
                 has_bid = any(sync.get_bridge_id(obj) for obj in context.selected_objects)
                 if has_bid:
-                    row = box.row()
-                    row.operator("sbox.bridge_clear_id", icon="TRASH")
+                    row = box.row(align=True)
+                    row.operator("sbox.bridge_apply_material", icon="MATERIAL")
+                    row.operator("sbox.bridge_clear_id", icon="TRASH", text="")
 
             # Send Children — active collection
             if context.collection and context.collection != context.scene.collection:

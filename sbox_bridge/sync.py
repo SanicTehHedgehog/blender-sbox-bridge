@@ -201,6 +201,10 @@ def geometry_hash(obj):
         verts = [c for v in mesh.vertices for c in v.co]
         faces = [vi for p in mesh.polygons for vi in p.vertices]
         scale = [round(s, 4) for s in obj.scale]
+        # Project scale_factor is baked into the vertices we send. Changing it
+        # must invalidate the hash so Sync All / next sync detects it as a
+        # change worth pushing.
+        sf = round(_get_scale_factor(), 4)
         mat_names = "|".join(m.name if m else "" for m in mesh.materials)
         uv_layer = mesh.uv_layers.active
         uv_floats = []
@@ -211,6 +215,7 @@ def geometry_hash(obj):
         data = (struct.pack(f'{len(verts)}f', *verts)
                 + struct.pack(f'{len(faces)}i', *faces)
                 + struct.pack('3f', *scale)
+                + struct.pack('f', sf)
                 + mat_names.encode('utf-8')
                 + struct.pack(f'{len(uv_floats)}f', *uv_floats))
         eval_obj.to_mesh_clear()
@@ -1663,15 +1668,27 @@ def on_depsgraph_update(scene, depsgraph):
                 mat = update.id.original
             except Exception:
                 mat = update.id
+            mat_name = mat.name if mat else None
+            if not mat_name:
+                continue
+            # Name-based slot match. Identity comparison (`slot is mat`) is
+            # fragile across depsgraph evaluated/original boundaries — name
+            # is what Blender actually keys materials on.
             for using_obj in bpy.data.objects:
                 if using_obj.type != "MESH" or using_obj.data is None:
                     continue
-                if not any(slot is mat for slot in using_obj.data.materials):
+                if not any(slot is not None and slot.name == mat_name
+                           for slot in using_obj.data.materials):
                     continue
                 if _should_skip_object(using_obj):
                     continue
                 bid = get_bridge_id(using_obj)
                 if bid:
+                    # Clear stored hash so the debounced send_update_mesh
+                    # doesn't gate on a hash that hasn't yet caught up to the
+                    # material edit.
+                    if "sbox_bridge_hash" in using_obj:
+                        del using_obj["sbox_bridge_hash"]
                     set_sync_status(using_obj, "modified")
                     _schedule_mesh_update(bid, using_obj)
             continue
