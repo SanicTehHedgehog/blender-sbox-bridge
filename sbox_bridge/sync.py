@@ -17,13 +17,16 @@ All conversion happens here. s&box does direct passthrough.
 """
 
 import bpy
+from bpy.app.handlers import persistent
 import bmesh
 import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import time
+from mathutils import Euler
 from . import connection
 
 
@@ -54,11 +57,33 @@ _material_hash_cache = {}       # material_name -> (content_hash, vmat_rel_path)
 _warnings = []                  # [(timestamp, message)]
 _pending_deletes = []           # [(bridgeId, timestamp)]
 
+# Deferred outbound (dirty-set). The depsgraph handler only MARKS objects
+# here; the poll timer drains them via _flush_dirty_sends(). Doing network
+# I/O inside the handler was a viewport-freeze hazard (synchronous POST with
+# a 5s timeout, per object, at up to 20Hz during drags) and a re-entrancy
+# amplifier. Coalescing is inherent: we store the object, not a transform
+# snapshot, and read its freshest state once per flush — a fast drag
+# collapses to a single send instead of queuing stale transforms.
+_dirty_sends = {}               # key -> (kind, obj); kind in
+                                # {transform, light, scene, create, create_light}
+
+# Scene IDs the engine has rejected as gone (deleted engine-side, different
+# scene/tab, or a previous session). Quarantined so we stop hammering
+# update_scene_transform on every move; cleared on sync_response / session
+# change so a refreshed link resumes automatically.
+_dead_scene_ids = set()
+
 # Chunked mesh state
 _chunked_streams = {}           # bridgeId -> stream state dict
 
 # Play mode
 _play_mode_active = False
+
+# Per-Blender-session nonce for idempotency keys. Blender's session_uid
+# counter restarts every launch, so "name_uid" alone collides with keys the
+# engine remembers from a previous Blender session — HandleCreate would then
+# bind the new object to a stale engine object instead of creating one.
+_session_nonce = "%08x" % random.getrandbits(32)
 
 # Constants
 CHUNK_VERTEX_LIMIT = 20000
@@ -85,36 +110,6 @@ def sbox_to_blender_pos(sx, sy, sz):
     return (-sy, sx, sz)
 
 
-def _snap_source(v):
-    """Round a source-unit value to the bridge grid_size, if configured.
-    Bridge-side grid snap — the source of truth for grid alignment. Blender's
-    own snap is unreliable for fractional steps in 4.2+ (Absolute Grid Snap
-    was removed; INCREMENT has a 1-BU floor at typical zooms), so the wire
-    enforces alignment regardless of viewport state. With grid_size=1 this
-    is a near no-op for any non-trivial position."""
-    try:
-        gs = bpy.context.scene.sbox_bridge.grid_size
-        if gs and gs > 0:
-            return round(v / gs) * gs
-    except Exception:
-        pass
-    return v
-
-
-def _wire_position(obj, sf):
-    """World position of obj, in s&box source units, snapped to grid_size."""
-    wp = obj.matrix_world.to_translation()
-    bx, by, bz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
-    return (_snap_source(bx * sf), _snap_source(by * sf), _snap_source(bz * sf))
-
-
-def _world_decompose(obj):
-    """Decompose obj.matrix_world into (world_translation, world_euler, world_scale).
-    Used so parented children send correct world transforms instead of local-to-parent."""
-    m = obj.matrix_world
-    return m.to_translation(), m.to_euler(), m.to_scale()
-
-
 # ── Bridge ID Helpers ────────────────────────────────────────────────────
 
 # Bridge ID is mirrored on obj.data so it survives undo/redo: Blender's undo
@@ -125,15 +120,26 @@ def get_bridge_id(obj):
     bid = obj.get("sbox_bridge_id")
     if bid:
         return bid
-    if obj.data is not None:
-        return obj.data.get("sbox_bridge_id")
+    # Data-side fallback is only trustworthy when the datablock has a single
+    # user. With linked duplicates (Alt+D) the mesh is shared, so the mirror
+    # can only name ONE of the objects — falling back here made every linked
+    # copy resolve to the original's bridge ID (one s&box object driven by
+    # two Blender objects, delete spam, no new object on Alt+D).
+    data = obj.data
+    if data is not None and data.users <= 1:
+        return data.get("sbox_bridge_id")
     return None
 
 
 def set_bridge_id(obj, bridge_id):
     obj["sbox_bridge_id"] = bridge_id
-    if obj.data is not None:
-        obj.data["sbox_bridge_id"] = bridge_id
+    data = obj.data
+    if data is not None:
+        # Never overwrite the mirror on shared data — it anchors the first
+        # owner's undo recovery, and linked duplicates track their own IDs
+        # purely on the object side.
+        if data.users <= 1 or "sbox_bridge_id" not in data:
+            data["sbox_bridge_id"] = bridge_id
 
 
 def clear_bridge_id(obj):
@@ -154,6 +160,7 @@ def find_by_bridge_id(bridge_id):
     return None
 
 
+@persistent
 def on_undo_post(scene):
     """After undo/redo, re-seed obj-side bridge IDs from mesh-data side.
 
@@ -167,7 +174,10 @@ def on_undo_post(scene):
         if obj.get("sbox_bridge_id"):
             continue
         data = obj.data
-        if data is None:
+        if data is None or data.users > 1:
+            # Shared data (linked duplicates): the mirror can't say which
+            # object it belongs to — reseeding would clone one ID onto all
+            # copies. Skip; only single-user data is unambiguous.
             continue
         mesh_id = data.get("sbox_bridge_id")
         if mesh_id:
@@ -184,9 +194,15 @@ def _get_scale_factor():
 def _should_skip_object(obj):
     """Return True if this object should NOT be synced to s&box.
     Filters out hidden objects, cutters, and other non-visual objects."""
-    # Hidden in viewport
-    if obj.hide_viewport or obj.hide_get():
-        return True
+    # Hidden in viewport. hide_get() needs a valid view-layer context — from
+    # a timer during file load/render it can raise, and an exception here
+    # unwinds the depsgraph handler (traceback on every move) or kills the
+    # poll timer. Treat "can't tell" as visible.
+    try:
+        if obj.hide_viewport or obj.hide_get():
+            return True
+    except Exception:
+        pass
     # Cutter/boolean objects (common in KitOps, HardOps, etc.)
     name_lower = obj.name.lower()
     if "cutter" in name_lower or "boolean" in name_lower:
@@ -406,7 +422,7 @@ def send_create(obj):
 
         wp = obj.matrix_world.to_translation()
         px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
-        idem_key = f"{obj.name}_{getattr(obj, 'session_uid', id(obj))}"
+        idem_key = f"{obj.name}_{getattr(obj, 'session_uid', id(obj))}_{_session_nonce}"
         geo_hash = geometry_hash(obj)
         hierarchy = get_collection_path(obj)
 
@@ -416,7 +432,7 @@ def send_create(obj):
             "seq": _blender_seq,
             "ack": _last_sbox_seq_processed,
             "name": obj.name,
-            "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
+            "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
             "rotation": _rotation_to_sbox(obj),
             "meshData": mesh_data,
             "idempotencyKey": idem_key,
@@ -439,8 +455,12 @@ def send_create(obj):
         print(f"[Bridge] Create error '{obj.name}': {e}")
 
 
-def send_update_transform(obj):
-    """Send a transform-only update with 20Hz rate limiting."""
+def send_update_transform(obj, force=False):
+    """Send a transform-only update with 20Hz rate limiting.
+
+    force=True (dirty-set drain) skips the limiter: the drain cadence already
+    bounds the rate, and dropping here would LOSE the move — the dirty mark
+    was consumed, so a skipped final drag position never gets re-sent."""
     global _blender_seq
 
     bridge_id = get_bridge_id(obj)
@@ -449,7 +469,7 @@ def send_update_transform(obj):
 
     # 20Hz debounce per object
     now = time.time()
-    if now - _last_transform_send.get(bridge_id, 0) < TRANSFORM_SEND_INTERVAL:
+    if not force and now - _last_transform_send.get(bridge_id, 0) < TRANSFORM_SEND_INTERVAL:
         return
     _last_transform_send[bridge_id] = now
 
@@ -465,7 +485,7 @@ def send_update_transform(obj):
         "seq": _blender_seq,
         "ack": _last_sbox_seq_processed,
         "bridgeId": bridge_id,
-        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
+        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
     }
     connection.send(msg)
@@ -511,7 +531,7 @@ def send_update_mesh(obj):
         "ack": _last_sbox_seq_processed,
         "bridgeId": bridge_id,
         "name": obj.name,
-        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
+        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
         "meshData": mesh_data,
         "geometryHash": geo_hash,
@@ -529,6 +549,7 @@ def _send_chunked_mesh(obj, bridge_id, mesh_data):
     faces = mesh_data.get("faces", [])
     face_materials = mesh_data.get("faceMaterials", [])
     materials = mesh_data.get("materials", [])
+    face_uvs = mesh_data.get("faceUVs")
 
     total_verts = len(vertices) // 3
     chunk_float_size = CHUNK_VERTEX_LIMIT * 3
@@ -558,6 +579,7 @@ def _send_chunked_mesh(obj, bridge_id, mesh_data):
         "faces": faces,
         "face_materials": face_materials,
         "materials": materials,
+        "face_uvs": face_uvs,
         "chunk_count": chunk_count,
         "chunks_sent": 0,
         "cancelled": False,
@@ -582,7 +604,7 @@ def _send_chunked_mesh(obj, bridge_id, mesh_data):
                 if o:
                     wp = o.matrix_world.to_translation()
                     px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
-                    pos = {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)}
+                    pos = {"x": px * sf, "y": py * sf, "z": pz * sf}
                     rot = _rotation_to_sbox(o)
                 else:
                     pos = {"x": 0, "y": 0, "z": 0}
@@ -602,6 +624,10 @@ def _send_chunked_mesh(obj, bridge_id, mesh_data):
                 "position": pos,
                 "rotation": rot,
             }
+            # Only attach UVs when present — a JSON null would trip the
+            # dispatcher's array enumeration.
+            if s["face_uvs"]:
+                end_msg["faceUVs"] = s["face_uvs"]
             connection.send(end_msg)
             _chunked_streams.pop(bridge_id, None)
             return None
@@ -663,6 +689,29 @@ def send_sync():
     print("[Bridge] Requested sync.")
 
 
+# Grid spacing the bridge last broadcast — short-circuits re-broadcast when
+# an incoming grid_updated bounces back through the property update callback.
+_last_grid_sent = None
+
+
+def send_grid_changed(grid_size):
+    """Push bridge grid_size to s&box. s&box mirrors it into Gizmo.Settings.GridSpacing."""
+    global _blender_seq, _last_grid_sent
+    if not connection.is_connected():
+        return
+    if _last_grid_sent == grid_size:
+        return
+    _last_grid_sent = grid_size
+    _blender_seq += 1
+    msg = {
+        "type": "grid_changed",
+        "seq": _blender_seq,
+        "ack": _last_sbox_seq_processed,
+        "gridSize": int(grid_size),
+    }
+    connection.send(msg)
+
+
 def send_create_light(obj):
     """Create a light in s&box from a Blender light object."""
     global _blender_seq
@@ -680,7 +729,7 @@ def send_create_light(obj):
     wp = obj.matrix_world.to_translation()
     px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
     props = _extract_light_properties(obj)
-    idem_key = f"light_{obj.name}_{getattr(obj, 'session_uid', id(obj))}"
+    idem_key = f"light_{obj.name}_{getattr(obj, 'session_uid', id(obj))}_{_session_nonce}"
 
     _blender_seq += 1
     msg = {
@@ -689,7 +738,7 @@ def send_create_light(obj):
         "ack": _last_sbox_seq_processed,
         "name": obj.name,
         "lightType": sbox_light_type,
-        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
+        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
         "properties": props,
         "idempotencyKey": idem_key,
@@ -705,7 +754,7 @@ def send_create_light(obj):
         print(f"[Bridge] Light create failed '{obj.name}': {response}")
 
 
-def send_update_light(obj):
+def send_update_light(obj, force=False):
     """Send light property + transform update to s&box."""
     global _blender_seq
 
@@ -714,7 +763,7 @@ def send_update_light(obj):
         return
 
     now = time.time()
-    if now - _last_transform_send.get(bridge_id, 0) < TRANSFORM_SEND_INTERVAL:
+    if not force and now - _last_transform_send.get(bridge_id, 0) < TRANSFORM_SEND_INTERVAL:
         return
     _last_transform_send[bridge_id] = now
 
@@ -731,22 +780,46 @@ def send_update_light(obj):
         "seq": _blender_seq,
         "ack": _last_sbox_seq_processed,
         "bridgeId": bridge_id,
-        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
+        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
         "properties": props,
     }
     connection.send(msg)
 
 
-def send_scene_transform(obj):
+def quarantine_scene_id(scene_id):
+    """Stop syncing a scene object whose engine counterpart is gone. Called
+    from connection when the engine rejects update_scene_transform as
+    not-found. Names the orphan in the panel so the user knows what to fix."""
+    if scene_id in _dead_scene_ids:
+        return
+    _dead_scene_ids.add(scene_id)
+    name = "?"
+    try:
+        for obj in bpy.data.objects:
+            if obj.get("sbox_scene_id") == scene_id:
+                name = obj.name
+                break
+    except Exception:
+        pass
+    add_warning(
+        f"'{name}' points at an s&box object that no longer exists "
+        f"(stale scene link {str(scene_id)[:8]}…) — pausing its sync. "
+        f"Delete it in Blender, or Sync All to refresh."
+    )
+
+
+def send_scene_transform(obj, force=False):
     """Send position update for a scene object (model/light from s&box)."""
     scene_id = obj.get("sbox_scene_id")
     if not scene_id:
         return
+    if scene_id in _dead_scene_ids:
+        return
 
     key = f"scene_{scene_id}"
     now = time.time()
-    if now - _last_transform_send.get(key, 0) < TRANSFORM_SEND_INTERVAL:
+    if not force and now - _last_transform_send.get(key, 0) < TRANSFORM_SEND_INTERVAL:
         return
     _last_transform_send[key] = now
 
@@ -761,7 +834,7 @@ def send_scene_transform(obj):
         "seq": _blender_seq,
         "ack": _last_sbox_seq_processed,
         "sceneId": scene_id,
-        "position": {"x": _snap_source(px * sf), "y": _snap_source(py * sf), "z": _snap_source(pz * sf)},
+        "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
     }
     connection.send(msg)
@@ -798,8 +871,28 @@ def process_incoming(msg):
             _handle_light_updated(msg)
         elif msg_type == "play_mode":
             _handle_play_mode(msg)
+        elif msg_type == "grid_updated":
+            _handle_grid_updated(msg)
     finally:
         _suppress_depsgraph = False
+
+
+def _handle_grid_updated(msg):
+    """s&box's Gizmo.Settings.GridSpacing changed. Mirror it into bridge grid_size.
+    Stamp _last_grid_sent first so the property update callback's send_grid_changed
+    short-circuits (no echo back to s&box)."""
+    global _last_grid_sent
+    gs = msg.get("gridSize")
+    if gs is None:
+        return
+    try:
+        gs = int(gs)
+        if gs < 1 or gs > 256:
+            return
+        _last_grid_sent = gs
+        bpy.context.scene.sbox_bridge.grid_size = gs
+    except Exception as e:
+        print(f"[Bridge] grid_updated handler error: {e}")
 
 
 def _handle_updated(msg):
@@ -836,16 +929,26 @@ def _handle_mesh_updated(msg):
         return
 
     _remote_update_times[bridge_id] = time.time()
-    _apply_sbox_transform(obj, msg)
 
     # Export Only mode — never overwrite Blender mesh with s&box data
     if get_sync_mode() == 'EXPORT_ONLY':
+        _apply_sbox_transform(obj, msg)
         return
 
     mesh_data = msg.get("meshData")
     if mesh_data and mesh_data.get("vertices"):
+        # Rebuild before applying the transform: the rebuild resets scale to 1
+        # (incoming verts are world-scale-baked), so the transform goes through
+        # the plain positive-determinant path.
         _rebuild_mesh(obj, mesh_data)
+        _apply_sbox_transform(obj, msg)
+        # Restamp hash + scale tracking so the depsgraph fire caused by this
+        # write doesn't bounce an identical mesh straight back to s&box.
+        set_stored_hash(obj, geometry_hash(obj))
+        _last_scale[bridge_id] = tuple(round(s, 4) for s in obj.scale)
         set_sync_status(obj, "received")
+    else:
+        _apply_sbox_transform(obj, msg)
 
 
 def _handle_object_created(msg):
@@ -920,6 +1023,10 @@ def _handle_sync_response(msg):
     global _last_known_bridge_ids
     objects = msg.get("objects", [])
     received_ids = set()
+
+    # Fresh reconciliation — retry any quarantined scene links; if they're
+    # still gone, the next rejection re-quarantines them.
+    _dead_scene_ids.clear()
 
     # Collect all bridge IDs Blender currently has BEFORE processing
     local_ids = set()
@@ -1050,7 +1157,17 @@ def _create_from_sbox(msg):
 
 
 def _rebuild_mesh(obj, mesh_data):
-    """Replace an existing Blender object's mesh with new data from s&box."""
+    """Replace an existing Blender object's mesh with new data from s&box.
+
+    Incoming vertices arrive with world scale baked in (that is how
+    _extract_mesh_data sent them), so the object's scale is reset to 1 after
+    the swap — keeping the old scale would apply it a second time on top of
+    the baked data, visibly inflating or shrinking the object after every
+    s&box-side edit. The reset also normalizes reflected (negative-scale)
+    matrices: any mirror parity is already present in the baked vertex data,
+    and with a positive-determinant matrix the face winding from s&box is
+    correct as-is.
+    """
     sf = _get_scale_factor()
     inv_sf = 1.0 / sf if sf else 1.0
 
@@ -1091,10 +1208,27 @@ def _rebuild_mesh(obj, mesh_data):
     bm.free()
     mesh.update()
 
+    # Reseed the data-side bridge ID mirror on the fresh mesh — undo recovery
+    # (on_undo_post) restores the object-side ID from mesh data, and the swap
+    # would otherwise leave the new datablock without one.
+    bid = obj.get("sbox_bridge_id")
+    if bid:
+        mesh["sbox_bridge_id"] = bid
+
     old_mesh = obj.data
+    # Preserve material slots across the rebuild — the wire payload from
+    # s&box carries only geometry, and a bare new datablock silently drops
+    # every material (object goes untextured in Blender after any
+    # s&box-side edit). Per-face assignment can't survive (topology may
+    # have changed), so faces land on slot 0.
+    if old_mesh is not None:
+        for mat in old_mesh.materials:
+            mesh.materials.append(mat)
     obj.data = mesh
     if old_mesh and old_mesh.users == 0:
         bpy.data.meshes.remove(old_mesh)
+
+    obj.scale = (1.0, 1.0, 1.0)
 
 
 def _create_light(msg):
@@ -1311,7 +1445,15 @@ def _extract_mesh_data(obj, sf):
         # world position are sent separately and applied by s&box. Baking
         # rotation here would double-rotate (s&box re-applies WorldRotation);
         # baking translation would mis-place parented children.
-        ws = obj.matrix_world.to_scale()
+        #
+        # Use Matrix.decompose() rather than to_scale(): decompose returns
+        # SIGNED scale and the matching proper rotation, so a reflected world
+        # matrix (negative-scale objects, "S X -1" mirrors) is faithfully split
+        # into rotation + signed scale. to_scale() returns absolute magnitudes
+        # and to_euler() loses the sign, which silently drops the reflection
+        # on the wire — s&box then shows un-reflected geometry and the user
+        # sees inverted normals on that side.
+        _, _, ws = obj.matrix_world.decompose()
 
         vertices = []
         for v in mesh.vertices:
@@ -1321,25 +1463,45 @@ def _extract_mesh_data(obj, sf):
             cvt = blender_to_sbox_pos(bx, by, bz)
             vertices.extend(0.0 if (math.isnan(c) or math.isinf(c)) else c for c in cvt)
 
-        faces = []
-        face_materials = []
+        # When the world matrix is reflected (negative determinant — happens
+        # with negative scale, "S X -1" mirrors, some FBX/glTF imports),
+        # baking the signed scale into verts above reflects the geometry into
+        # the wire payload. But CCW-from-outside winding now reads as
+        # CW-from-outside in s&box, because the reflection flipped the
+        # apparent face orientation. Reverse winding (and matching UV order)
+        # to restore CCW-from-outside under s&box's positive-det world frame.
+        flip_winding = obj.matrix_world.determinant() < 0
+
         # Per-loop UVs from the active UV layer. Flat [u, v, u, v, ...] aligned
         # with face vertex order: face N's UVs immediately follow face N-1's.
         # V is flipped (1 - v) because Blender uses V=0 at bottom while Source
         # 2 / s&box conventionally treats V=0 at top — without the flip,
         # textures appear vertically inverted.
         uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
+
+        faces = []
+        face_materials = []
         face_uvs = [] if uv_layer else None
         for poly in mesh.polygons:
-            faces.append(len(poly.vertices))
-            for vi in poly.vertices:
-                faces.append(vi)
-            face_materials.append(poly.material_index)
+            poly_verts = list(poly.vertices)
             if uv_layer:
-                for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
-                    uv = uv_layer[li].uv
-                    face_uvs.append(uv.x)
-                    face_uvs.append(1.0 - uv.y)
+                poly_uvs = [
+                    (uv_layer[li].uv.x, 1.0 - uv_layer[li].uv.y)
+                    for li in range(poly.loop_start, poly.loop_start + poly.loop_total)
+                ]
+            else:
+                poly_uvs = None
+            if flip_winding:
+                poly_verts.reverse()
+                if poly_uvs is not None:
+                    poly_uvs.reverse()
+            faces.append(len(poly_verts))
+            faces.extend(poly_verts)
+            face_materials.append(poly.material_index)
+            if poly_uvs is not None:
+                for u, v in poly_uvs:
+                    face_uvs.append(u)
+                    face_uvs.append(v)
 
         materials = _extract_materials(obj)
         eval_obj.to_mesh_clear()
@@ -1541,6 +1703,13 @@ def _generate_vmat_and_copy_textures(mat_data):
     g = bc[1] if len(bc) > 1 else 0.8
     b = bc[2] if len(bc) > 2 else 0.8
 
+    # When a color texture drives albedo, ignore the BSDF's Base Color value:
+    # Blender leaves default_value at whatever it was before the texture was
+    # plugged in, and writing it as g_vColorTint multiplies the texture by
+    # that stale color (the "still blue after switching to an image" bug).
+    if color_ref:
+        r = g = b = 1.0
+
     lines = [
         "// AUTO-GENERATED BY BLENDER BRIDGE",
         "",
@@ -1625,7 +1794,16 @@ def _extract_light_properties(obj):
 # ── Transform Helpers ────────────────────────────────────────────────────
 
 def _rotation_to_sbox(obj):
-    we = obj.matrix_world.to_euler()
+    """World rotation for the wire, taken from matrix_world.decompose().
+
+    decompose(), not to_euler(): for a reflected world matrix (negative
+    scale, mirrors) decompose returns the proper rotation that pairs with
+    the SIGNED scale _extract_mesh_data bakes into the vertices. to_euler()
+    reads the un-fixed improper matrix and returns a rotation ~180° away
+    from that pairing, which mis-orients every mirrored object in s&box.
+    For normal matrices the two are identical."""
+    _, rq, _ = obj.matrix_world.decompose()
+    we = rq.to_euler()
     return {
         "pitch": math.degrees(we.x),
         "yaw": math.degrees(we.z),
@@ -1638,31 +1816,132 @@ def _apply_sbox_transform(obj, msg):
     sf = _get_scale_factor()
     inv_sf = 1.0 / sf if sf else 1.0
 
+    new_loc = None
     if "position" in msg:
         p = msg["position"]
         bx, by, bz = sbox_to_blender_pos(
             p.get("x", 0.0), p.get("y", 0.0), p.get("z", 0.0)
         )
-        obj.location = (bx * inv_sf, by * inv_sf, bz * inv_sf)
+        new_loc = (bx * inv_sf, by * inv_sf, bz * inv_sf)
 
+    new_rot = None
     if "rotation" in msg:
         r = msg["rotation"]
-        obj.rotation_euler = (
+        new_rot = (
             math.radians(r.get("pitch", 0.0)),
             math.radians(r.get("roll", 0.0)),
             math.radians(r.get("yaw", 0.0)),
         )
 
+    if new_rot is not None and obj.matrix_world.determinant() < 0:
+        # Reflected (mirrored) object. The wire rotation pairs with the signed
+        # scale that decompose() spreads across all three axes — writing it
+        # straight into rotation_euler would pair it with the object's local
+        # scale signs instead and mis-orient it by 180°. Rotate the whole
+        # world basis by the delta so decompose() lands exactly on the target
+        # rotation while the reflection is preserved. Position rides along in
+        # the same matrix write: obj.location wouldn't be visible in
+        # matrix_world until the next depsgraph evaluation.
+        m = obj.matrix_world.copy()
+        _, current_q, _ = m.decompose()
+        target_q = Euler(new_rot, 'XYZ').to_quaternion()
+        delta = target_q @ current_q.inverted()
+        new_m = (delta.to_matrix() @ m.to_3x3()).to_4x4()
+        new_m.translation = new_loc if new_loc is not None else m.to_translation()
+        obj.matrix_world = new_m
+        return
+
+    if new_loc is not None:
+        obj.location = new_loc
+    if new_rot is not None:
+        obj.rotation_euler = new_rot
+
 
 # ── Depsgraph Handler ───────────────────────────────────────────────────
 
+_last_play_mute_note = 0.0
+
+
+def _note_play_mute():
+    """Surface the play-mode outbound mute instead of dropping moves silently."""
+    global _last_play_mute_note
+    now = time.time()
+    if now - _last_play_mute_note > 10.0:
+        _last_play_mute_note = now
+        log_activity("Outbound muted: play-mode flag set (self-clears via poll)")
+
+
+def _mark_dirty(kind, key, obj):
+    """Queue an outbound send for the poll timer to flush. Last mark for a
+    key wins — the flush reads the object's current state, so intermediate
+    drag positions are never sent."""
+    _dirty_sends[key] = (kind, obj)
+
+
+def _flush_dirty_sends():
+    """Drain the dirty-set. Runs from the poll timer, never from the
+    depsgraph handler. Returns the number of entries drained."""
+    if not _dirty_sends:
+        return 0
+    pending = list(_dirty_sends.items())
+    _dirty_sends.clear()
+    for key, (kind, obj) in pending:
+        # Object may have been deleted between mark and flush.
+        try:
+            if obj is None or not obj.name:
+                continue
+        except ReferenceError:
+            continue
+        try:
+            if kind == "transform":
+                send_update_transform(obj, force=True)
+            elif kind == "light":
+                send_update_light(obj, force=True)
+            elif kind == "scene":
+                send_scene_transform(obj, force=True)
+            elif kind == "create":
+                # Re-check: a flush in between (or _check_duplicates) may
+                # already have created it.
+                if not get_bridge_id(obj):
+                    send_create(obj)
+            elif kind == "create_light":
+                if not get_bridge_id(obj):
+                    send_create_light(obj)
+        except ReferenceError:
+            continue
+        except Exception as e:
+            print(f"[Bridge] Deferred send failed ({kind}, {key}): {e}")
+    return len(pending)
+
+
+@persistent
 def on_depsgraph_update(scene, depsgraph):
-    """Called after every depsgraph update. Routes changes to s&box."""
+    """Called after every depsgraph update. Marks changed objects in the
+    dirty-set; the poll timer does the actual network I/O. Only the mesh
+    debounce path keeps its own timer (it already deferred).
+
+    @persistent is load-bearing: without it, Blender FREES this handler on
+    every .blend load (documented bpy.app.handlers behavior). The failure is
+    perfectly silent and asymmetric — connection, polling, inbound applies,
+    and all operator buttons keep working; only live outbound dies. That was
+    the root cause of the long-running 'Blender→engine stops syncing after a
+    restart' intermittency."""
     if _suppress_depsgraph:
         return
     if not connection.is_connected():
         return
+    # Watchdog: if the poll timer died (an exception in a past tick), nothing
+    # else restarts it — and the play-mode flag can then never self-heal from
+    # the poll response, muting all outbound while the panel reads Connected.
+    # Resurrect it on user activity.
+    try:
+        if not bpy.app.timers.is_registered(_poll_and_process):
+            start_timer()
+            log_activity("Poll timer was dead — restarted")
+    except Exception:
+        pass
     if _play_mode_active:
+        _note_play_mute()
         return
 
     try:
@@ -1740,7 +2019,8 @@ def on_depsgraph_update(scene, depsgraph):
         # Scene objects (models/lights from s&box) — position updates only
         if obj.get("sbox_scene_id") or obj.get("sbox_type"):
             if not update.is_updated_geometry:
-                send_scene_transform(obj)
+                sid = obj.get("sbox_scene_id") or obj.name
+                _mark_dirty("scene", f"scene_{sid}", obj)
             continue
 
         # Skip unsupported and convertible types
@@ -1753,9 +2033,10 @@ def on_depsgraph_update(scene, depsgraph):
                 continue
             bridge_id = get_bridge_id(obj)
             if bridge_id:
-                send_update_light(obj)
+                _mark_dirty("light", bridge_id, obj)
             elif not obj.get("sbox_scene_id"):
-                send_create_light(obj)
+                uid = getattr(obj, "session_uid", id(obj))
+                _mark_dirty("create_light", f"create_{uid}", obj)
             continue
 
         # Non-mesh — skip
@@ -1783,11 +2064,17 @@ def on_depsgraph_update(scene, depsgraph):
                 set_sync_status(obj, "modified")
                 _schedule_mesh_update(bridge_id, obj)
             else:
-                send_update_transform(obj)
+                _mark_dirty("transform", bridge_id, obj)
         else:
+            # Paste-dupe detection stays inline (cheap, no I/O) so a stale
+            # inherited ID is stripped before anything reads it. The create
+            # itself is deferred: send_create does full mesh extraction plus
+            # a blocking send_and_receive — the single worst in-handler stall
+            # (fires mid-drag on Ctrl+D duplicates).
             _detect_and_strip_paste_duplicate(obj)
             if not get_bridge_id(obj):
-                send_create(obj)
+                uid = getattr(obj, "session_uid", id(obj))
+                _mark_dirty("create", f"create_{uid}", obj)
 
 
 # ── Mesh Update Debounce ────────────────────────────────────────────────
@@ -1848,7 +2135,8 @@ def _detect_and_strip_paste_duplicate(obj):
 
 def _poll_and_process():
     """Blender timer callback: poll s&box and process messages."""
-    global _last_sbox_seq_processed, _current_session_id
+    global _last_sbox_seq_processed, _current_session_id, _last_grid_sent, \
+        _play_mode_active
 
     if not connection.is_connected():
         try:
@@ -1860,10 +2148,39 @@ def _poll_and_process():
             return 0.5  # Keep timer alive during reconnect
         return None  # Stop timer — disconnected
 
+    # Self-heal: anything that strips our handlers (a .blend load before
+    # @persistent existed, another addon clearing the list) kills live
+    # outbound with zero errors while inbound keeps working. Re-attach here
+    # — this timer is the one thing guaranteed to still be running.
+    try:
+        if on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(on_depsgraph_update)
+            log_activity("Depsgraph handler was missing — re-attached (live outbound restored)")
+        if on_undo_post not in bpy.app.handlers.undo_post:
+            bpy.app.handlers.undo_post.append(on_undo_post)
+        if on_undo_post not in bpy.app.handlers.redo_post:
+            bpy.app.handlers.redo_post.append(on_undo_post)
+    except Exception:
+        pass
+
     try:
         response = connection.poll()
         if response is None:
             return 0.1
+
+        # Level-triggered play-mode sync. The edge-triggered play_mode
+        # messages can be missed (disconnect, restart while playing, spurious
+        # broadcast around a hot-reload), leaving _play_mode_active stuck True
+        # — which silently kills ALL depsgraph outbound (moves/edits) while
+        # timer paths (creates, deletes) keep working. The poll response
+        # carries ground truth every tick; trust it over the edges.
+        playing = response.get("playing")
+        if playing is not None and bool(playing) != _play_mode_active:
+            _play_mode_active = bool(playing)
+            add_warning(
+                f"Play mode {'ACTIVE — live sync paused' if _play_mode_active else 'inactive — live sync resumed'}"
+                " (synced from poll)"
+            )
 
         # Detect session change (s&box restarted or hot-reloaded)
         session_id = response.get("sessionId")
@@ -1871,11 +2188,16 @@ def _poll_and_process():
             _current_session_id = session_id
             _last_write_seq.clear()
             _last_sbox_seq_processed = 0
+            _dead_scene_ids.clear()
+            # New session knows nothing about our grid — clear the echo guard
+            # so the next grid change (either direction) always goes through.
+            _last_grid_sent = None
             log_activity(f"Session changed to {session_id}, resyncing...")
             send_sync()
             return 0.1
 
-        for msg in response.get("messages", []):
+        msgs = response.get("messages", [])
+        for msg in msgs:
             seq = msg.get("seq", 0)
             process_incoming(msg)
             if seq > _last_sbox_seq_processed:
@@ -1883,12 +2205,29 @@ def _poll_and_process():
 
     except Exception as e:
         print(f"[Bridge] Poll error: {e}")
+        msgs = []
 
-    _check_duplicates()
-    _check_deletions()
-    _check_hidden()
-    _confirm_pending_deletes()
-    return 0.1
+    # Drain deferred outbound marked by the depsgraph handler.
+    flushed = 0
+    try:
+        flushed = _flush_dirty_sends()
+    except Exception as e:
+        print(f"[Bridge] _flush_dirty_sends error: {e}")
+
+    # An uncaught exception below would kill this timer permanently while the
+    # connection still reads CONNECTED — no more polls, no play-state
+    # self-heal, panel green, outbound dead. Contain each step so one bad
+    # tick can't take the loop down.
+    for step in (_check_duplicates, _check_deletions, _check_hidden,
+                 _confirm_pending_deletes):
+        try:
+            step()
+        except Exception as e:
+            print(f"[Bridge] {step.__name__} error: {e}")
+    # Adaptive poll: burst to ~30Hz while s&box is streaming messages, tick
+    # at ~20Hz while outbound is flowing (keeps drag latency at the old
+    # direct-send feel), idle at 10Hz otherwise.
+    return 0.03 if msgs else (0.05 if flushed else 0.1)
 
 
 def _check_duplicates():
@@ -1937,7 +2276,11 @@ def _check_deletions():
 
     current_ids = set()
     for obj in bpy.data.objects:
-        bid = obj.get("sbox_bridge_id")
+        # get_bridge_id, not obj.get: must be the same view of identity that
+        # the rest of the addon uses, or an object whose obj-side prop was
+        # lost (undo) but is still recoverable via its data mirror gets a
+        # spurious delete sent for it.
+        bid = get_bridge_id(obj)
         if bid:
             current_ids.add(bid)
 
@@ -2020,9 +2363,16 @@ def get_or_create_sbox_collection():
 
 def start_timer():
     global _timer_running
-    if not _timer_running:
+    # _timer_running can lie: if _poll_and_process ever raised, Blender
+    # unregistered the timer but the flag stayed True, making start_timer a
+    # permanent no-op. Ask the timer registry for ground truth.
+    try:
+        alive = bpy.app.timers.is_registered(_poll_and_process)
+    except Exception:
+        alive = _timer_running
+    if not alive:
         bpy.app.timers.register(_poll_and_process, first_interval=0.1)
-        _timer_running = True
+    _timer_running = True
 
 
 def stop_timer():

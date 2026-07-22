@@ -109,6 +109,66 @@ def disconnect():
 
 # ── Send (Blender → s&box via POST /message) ─────────────────────────────
 
+_last_engine_error = (None, 0.0)    # (text, time) — throttles repeat rejections
+
+
+def _surface_engine_error(sent_json, body):
+    """The server answers dispatch failures with HTTP 200 + {"error": ...}.
+    Without reading the body, a rejected message (stale bridge id, dispatcher
+    exception) is indistinguishable from success on the Blender side — moves
+    silently stop arriving. Surface it in the console and panel warnings."""
+    global _last_engine_error
+    try:
+        data = json.loads(body)
+        err = data.get("error") if isinstance(data, dict) else None
+        if not err:
+            return
+        try:
+            mtype = json.loads(sent_json).get("type", "?")
+        except Exception:
+            mtype = "?"
+        # Stale scene link: the engine no longer has this GameObject
+        # (deleted, other scene/tab, previous session). Quarantine the id so
+        # we stop hammering it on every move — sync.py clears the quarantine
+        # on the next sync_response / session change.
+        if mtype == "update_scene_transform" and (
+                "not found" in err or "invalid sceneId" in err):
+            try:
+                sid = json.loads(sent_json).get("sceneId")
+                if sid:
+                    from . import sync
+                    sync.quarantine_scene_id(sid)
+            except Exception:
+                pass
+
+        text = f"engine rejected '{mtype}': {err}"
+        now = time.time()
+        if _last_engine_error[0] != text or now - _last_engine_error[1] > 5.0:
+            _last_engine_error = (text, now)
+            print(f"[s&box Bridge] {text}")
+            try:
+                from . import sync
+                sync.add_warning(text)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _encode_message(message):
+    """dict -> JSON string, or None if it contains NaN/inf. Raising here used
+    to unwind the depsgraph handler (traceback on every move with a degenerate
+    transform) — drop the one message loudly instead."""
+    if not isinstance(message, dict):
+        return message
+    try:
+        return json.dumps(message, allow_nan=False, default=str)
+    except ValueError as e:
+        print(f"[s&box Bridge] Dropped '{message.get('type', '?')}' message "
+              f"with non-finite floats: {e}")
+        return None
+
+
 def send(message):
     """Send a JSON message to s&box. Returns True on success.
     The message dict should already contain seq/ack fields."""
@@ -117,8 +177,9 @@ def send(message):
     if _state != CONNECTED:
         return False
 
-    if isinstance(message, dict):
-        message = json.dumps(message, allow_nan=False, default=str)
+    message = _encode_message(message)
+    if message is None:
+        return False
 
     try:
         conn = http.client.HTTPConnection(_host, _port, timeout=5)
@@ -128,15 +189,17 @@ def send(message):
             headers={"Content-Type": "application/json"},
         )
         resp = conn.getresponse()
-        resp.read()
+        body = resp.read().decode("utf-8", errors="replace")
         conn.close()
 
         if resp.status != 200:
+            print(f"[s&box Bridge] Send rejected with HTTP {resp.status}")
             _consecutive_failures += 1
             _check_auto_reconnect()
             return False
 
         _consecutive_failures = 0
+        _surface_engine_error(message, body)
         return True
 
     except Exception as e:
@@ -154,8 +217,9 @@ def send_and_receive(message):
     if _state != CONNECTED:
         return None
 
-    if isinstance(message, dict):
-        message = json.dumps(message, allow_nan=False, default=str)
+    message = _encode_message(message)
+    if message is None:
+        return None
 
     try:
         conn = http.client.HTTPConnection(_host, _port, timeout=5)

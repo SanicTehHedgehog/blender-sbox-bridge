@@ -6,7 +6,7 @@ Features sync direction controls, hierarchy mapping, status indicators, and geom
 bl_info = {
     "name": "s&box Bridge",
     "author": "SanicTehHedgehog",
-    "version": (3, 5, 0),
+    "version": (3, 6, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > s&box",
     "description": "Bidirectional scene sync with s&box game engine",
@@ -17,6 +17,40 @@ import bpy
 from . import connection
 from . import sync
 from . import panel
+
+
+def _apply_overlay_grid_scale(grid_size, scale_factor):
+    """Set every 3D viewport's overlay grid to grid_size / scale_factor Blender
+    units per cell (with the default 16/16, one Blender unit per cell).
+
+    Walks bpy.data.screens rather than bpy.context.screen: grid changes pushed
+    by s&box are applied from the poll timer, where bpy.context has no window
+    and context.screen is None — the data API works from any context and keeps
+    every workspace's viewports consistent."""
+    try:
+        sf = max(scale_factor, 1e-6)
+        display_scale = float(grid_size) / sf
+        for screen in bpy.data.screens:
+            for area in screen.areas:
+                if area.type != 'VIEW_3D':
+                    continue
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.overlay.grid_scale = display_scale
+                area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _on_grid_size_changed(self, context):
+    """grid_size changed in Blender. Push to s&box (mirrors into the editor's
+    grid spacing) and update Blender's viewport overlay so the visual grid
+    matches what the bridge is reporting to the engine."""
+    try:
+        sync.send_grid_changed(self.grid_size)
+    except Exception as e:
+        print(f"[Bridge] grid_size send error: {e}")
+    _apply_overlay_grid_scale(self.grid_size, self.scale_factor)
 
 
 def _on_scale_factor_changed(self, context):
@@ -45,6 +79,9 @@ def _on_scale_factor_changed(self, context):
         sync.log_activity(f"Project scale -> {self.scale_factor:.2f}, resynced {count} bridge object(s)")
         return None
     bpy.app.timers.register(deferred, first_interval=0.1)
+    # Overlay cell size is grid_size / scale_factor, so a scale change moves
+    # the visual grid too.
+    _apply_overlay_grid_scale(self.grid_size, self.scale_factor)
 
 
 # ── Addon Properties ───────────────────────────────────────────────���──────
@@ -78,7 +115,13 @@ class SboxBridgeSettings(bpy.types.PropertyGroup):
     )
     grid_size: bpy.props.IntProperty(
         name="Grid Size", default=16, min=1, max=256,
-        description="Active s&box grid size",
+        description=(
+            "Bridge grid size in s&box source units. Mirrored to the "
+            "s&box editor's grid spacing and to Blender's viewport "
+            "overlay grid (display scale = grid_size / scale_factor). "
+            "Use [ / ] hotkeys to halve / double."
+        ),
+        update=_on_grid_size_changed,
     )
     auto_reconnect: bpy.props.BoolProperty(
         name="Auto Reconnect", default=True,
@@ -113,6 +156,9 @@ classes = (
     panel.SBOX_OT_ForceResync,
     panel.SBOX_OT_DeleteBridgeMaterial,
     panel.SBOX_OT_OpenBridgeMaterialFolder,
+    panel.SBOX_OT_SetGridSize,
+    panel.SBOX_OT_HalveGrid,
+    panel.SBOX_OT_DoubleGrid,
     panel.SBOX_OT_SyncAll,
     panel.SBOX_OT_SendToScene,
     panel.SBOX_OT_ApplyMaterial,
@@ -126,6 +172,32 @@ classes = (
 )
 
 
+_keymaps = []
+
+
+def _register_keymaps():
+    """Bind '[' / ']' to halve / double grid in the 3D View. Keymaps are attached
+    to the user's keyconfig (addon section) so the bindings unregister cleanly."""
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon
+    if not kc:
+        return
+    km = kc.keymaps.new(name='3D View', space_type='VIEW_3D')
+    kmi = km.keymap_items.new('sbox.bridge_halve_grid', 'LEFT_BRACKET', 'PRESS')
+    _keymaps.append((km, kmi))
+    kmi = km.keymap_items.new('sbox.bridge_double_grid', 'RIGHT_BRACKET', 'PRESS')
+    _keymaps.append((km, kmi))
+
+
+def _unregister_keymaps():
+    for km, kmi in _keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
+    _keymaps.clear()
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -136,12 +208,14 @@ def register():
         bpy.app.handlers.undo_post.append(sync.on_undo_post)
     if sync.on_undo_post not in bpy.app.handlers.redo_post:
         bpy.app.handlers.redo_post.append(sync.on_undo_post)
+    _register_keymaps()
     print("[s&box Bridge v2] Addon registered.")
 
 
 def unregister():
     connection.disconnect()
     sync.stop_timer()
+    _unregister_keymaps()
     if sync.on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(sync.on_depsgraph_update)
     if sync.on_undo_post in bpy.app.handlers.undo_post:

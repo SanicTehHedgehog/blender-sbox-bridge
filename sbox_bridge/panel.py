@@ -91,6 +91,43 @@ class SBOX_OT_Disconnect(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SBOX_OT_SetGridSize(bpy.types.Operator):
+    """Set bridge grid_size to a preset value. Wired to the [1, 2, 4, 8, 16, 32, 64, 128]
+    button row in the panel; the property's update callback handles the rest."""
+    bl_idname = "sbox.bridge_set_grid_size"
+    bl_label = "Set Grid Size"
+    bl_options = {'INTERNAL'}
+    value: bpy.props.IntProperty(min=1, max=256)
+
+    def execute(self, context):
+        context.scene.sbox_bridge.grid_size = self.value
+        return {"FINISHED"}
+
+
+class SBOX_OT_HalveGrid(bpy.types.Operator):
+    """Halve the bridge grid_size, clamped at 1. Bound to '[' by default."""
+    bl_idname = "sbox.bridge_halve_grid"
+    bl_label = "Halve Grid"
+
+    def execute(self, context):
+        s = context.scene.sbox_bridge
+        s.grid_size = max(1, s.grid_size // 2)
+        self.report({"INFO"}, f"Grid: {s.grid_size}")
+        return {"FINISHED"}
+
+
+class SBOX_OT_DoubleGrid(bpy.types.Operator):
+    """Double the bridge grid_size, clamped at 256. Bound to ']' by default."""
+    bl_idname = "sbox.bridge_double_grid"
+    bl_label = "Double Grid"
+
+    def execute(self, context):
+        s = context.scene.sbox_bridge
+        s.grid_size = min(256, s.grid_size * 2)
+        self.report({"INFO"}, f"Grid: {s.grid_size}")
+        return {"FINISHED"}
+
+
 class SBOX_OT_SyncAll(bpy.types.Operator):
     bl_idname = "sbox.bridge_sync_all"
     bl_label = "Sync All"
@@ -565,7 +602,16 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
             box.prop(settings, "sync_mode")
             box.prop(settings, "auto_sync")
             box.prop(settings, "scale_factor")
-            box.prop(settings, "grid_size")
+            row = box.row(align=True)
+            row.label(text="Grid")
+            row.prop(settings, "grid_size", text="")
+            row.operator("sbox.bridge_halve_grid", text="", icon='REMOVE')
+            row.operator("sbox.bridge_double_grid", text="", icon='ADD')
+            presets = box.row(align=True)
+            for v in (1, 2, 4, 8, 16, 32, 64, 128):
+                op = presets.operator("sbox.bridge_set_grid_size", text=str(v),
+                                      depress=(settings.grid_size == v))
+                op.value = v
             box.prop(settings, "project_assets_path")
             box.prop(settings, "auto_reconnect")
 

@@ -41,7 +41,7 @@ Model, transform, texture, and map from Blender directly to the s&box scene edit
 - **Chunked transfer** — Large meshes (20k+ vertices) stream without freezing
 - **Auto-reconnect** — Connection recovers automatically if s&box restarts
 - **Send to Scene** — Manually push selected objects with one click
-- **Grid alignment** — Match Blender's grid to s&box units
+- **Grid sync** — Bridge `grid_size` mirrors `Gizmo.Settings.GridSpacing` in s&box and `View3D.overlay.grid_scale` in Blender. Preset buttons `1/2/4/8/16/32/64/128`, `[` / `]` to halve / double.
 
 ## Panel Overview
 
@@ -50,7 +50,7 @@ The addon adds an **s&box** tab to Blender's N-panel with:
 | Section | Description |
 |---------|-------------|
 | **Connection** | Connect/disconnect, host/port settings |
-| **Grid Size** | Quick buttons to match s&box grid (2, 4, 8, 16, 32) |
+| **Grid Size** | Slider + halve/double buttons + preset row (`1 2 4 8 16 32 64 128`). Bidirectionally synced with `Gizmo.Settings.GridSpacing` in s&box. Values >128 clamp on the s&box side (engine ceiling). |
 | **Sync** | Auto Sync toggle, Scale Factor, Assets Path, Sync All / Force Resync / Send to Scene |
 | **Info** | Synced object count, latency, play mode indicator |
 | **Pending Deletes** | Confirm or cancel deletions (5-second safety window) |
