@@ -6,7 +6,7 @@ Features sync direction controls, hierarchy mapping, status indicators, and geom
 bl_info = {
     "name": "s&box Bridge",
     "author": "SanicTehHedgehog",
-    "version": (3, 6, 0),
+    "version": (3, 7, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > s&box",
     "description": "Bidirectional scene sync with s&box game engine",
@@ -53,13 +53,25 @@ def _on_grid_size_changed(self, context):
     _apply_overlay_grid_scale(self.grid_size, self.scale_factor)
 
 
+# Handle of the currently-scheduled deferred resync, so a slider drag
+# (which fires the update callback per mouse step) rearms ONE timer instead
+# of queuing a full-scene resync per step.
+_scale_resync_pending = None
+
+
 def _on_scale_factor_changed(self, context):
     """Project scale_factor changed. The factor is baked into vertex positions
     on the wire, so every existing bridge object now has stale geometry on the
     s&box side. Clear all stored geometry hashes and queue a deferred force-
-    resync of every bridge object. Deferred via timer because property-update
-    callbacks run mid-write — we can't safely walk bpy.data inline."""
+    resync of every bridge object. Debounced 0.75s: only the final value after
+    a slider drag triggers the (expensive) full-scene resync. Deferred via
+    timer because property-update callbacks run mid-write — we can't safely
+    walk bpy.data inline."""
+    global _scale_resync_pending
+
     def deferred():
+        global _scale_resync_pending
+        _scale_resync_pending = None
         if not connection.is_connected():
             return None
         for obj in bpy.data.objects:
@@ -76,9 +88,21 @@ def _on_scale_factor_changed(self, context):
             elif obj.type == "LIGHT" and sync.get_bridge_id(obj):
                 sync.send_update_light(obj)
                 count += 1
-        sync.log_activity(f"Project scale -> {self.scale_factor:.2f}, resynced {count} bridge object(s)")
+        try:
+            sf = bpy.context.scene.sbox_bridge.scale_factor
+        except Exception:
+            sf = 0.0
+        sync.log_activity(f"Project scale -> {sf:.2f}, resynced {count} bridge object(s)")
         return None
-    bpy.app.timers.register(deferred, first_interval=0.1)
+
+    # Rearm: cancel any previously-scheduled resync, keep only the latest.
+    try:
+        if _scale_resync_pending is not None and bpy.app.timers.is_registered(_scale_resync_pending):
+            bpy.app.timers.unregister(_scale_resync_pending)
+    except Exception:
+        pass
+    _scale_resync_pending = deferred
+    bpy.app.timers.register(deferred, first_interval=0.75)
     # Overlay cell size is grid_size / scale_factor, so a scale change moves
     # the visual grid too.
     _apply_overlay_grid_scale(self.grid_size, self.scale_factor)
@@ -153,6 +177,7 @@ classes = (
     SboxBridgeSettings,
     panel.SBOX_OT_Connect,
     panel.SBOX_OT_Disconnect,
+    panel.SBOX_OT_ClearWarnings,
     panel.SBOX_OT_ForceResync,
     panel.SBOX_OT_DeleteBridgeMaterial,
     panel.SBOX_OT_OpenBridgeMaterialFolder,

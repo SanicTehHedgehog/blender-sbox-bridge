@@ -66,6 +66,8 @@ _pending_deletes = []           # [(bridgeId, timestamp)]
 # collapses to a single send instead of queuing stale transforms.
 _dirty_sends = {}               # key -> (kind, obj); kind in
                                 # {transform, light, scene, create, create_light}
+_first_dirty_time = None        # when the dirty-set went non-empty; canary for
+                                # a stalled flush (see get_degraded_reason)
 
 # Scene IDs the engine has rejected as gone (deleted engine-side, different
 # scene/tab, or a previous session). Quarantined so we stop hammering
@@ -89,7 +91,14 @@ _session_nonce = "%08x" % random.getrandbits(32)
 CHUNK_VERTEX_LIMIT = 20000
 TRANSFORM_SEND_INTERVAL = 0.05  # 20Hz max
 MESH_DEBOUNCE_INTERVAL = 0.15
-PENDING_DELETE_TIMEOUT = 5.0
+# 30s, not 5: five seconds is shorter than the time it takes to notice the
+# countdown exists — during undo storms objects were destroyed engine-side
+# before the user ever saw the pending queue.
+PENDING_DELETE_TIMEOUT = 30.0
+# More than this many simultaneous pending deletes never auto-confirm — a
+# mass delete is either intentional (one click is cheap) or an accident
+# (auto-confirm would be catastrophic).
+PENDING_DELETE_BULK_GATE = 5
 
 # Feature filtering
 SYNCABLE_TYPES = {"MESH", "LIGHT"}
@@ -182,6 +191,27 @@ def on_undo_post(scene):
         mesh_id = data.get("sbox_bridge_id")
         if mesh_id:
             obj["sbox_bridge_id"] = mesh_id
+
+    # Undo resurrected a deleted object? Cancel its pending engine-side
+    # delete — otherwise the fuse burns down and destroys the engine object
+    # while its Blender counterpart is alive again (the undo-orphan bug).
+    if _pending_deletes:
+        alive = set()
+        for obj in bpy.data.objects:
+            bid = get_bridge_id(obj)
+            if bid:
+                alive.add(bid)
+        resurrected = [(b, t) for b, t in _pending_deletes if b in alive]
+        if resurrected:
+            _pending_deletes[:] = [(b, t) for b, t in _pending_deletes
+                                   if b not in alive]
+            for bid, _ in resurrected:
+                _last_known_bridge_ids.add(bid)
+            log_activity(
+                f"Undo restored {len(resurrected)} object(s) — "
+                "pending delete(s) cancelled"
+            )
+            connection.notify_ui()
 
 
 def _get_scale_factor():
@@ -363,10 +393,16 @@ def add_warning(message):
     if len(_warnings) > 10:
         _warnings.pop(0)
     log_activity(f"WARNING: {message}")
+    connection.notify_ui()
 
 
 def get_warnings():
     return list(_warnings)
+
+
+def clear_warnings():
+    _warnings.clear()
+    connection.notify_ui()
 
 
 def get_pending_deletes():
@@ -381,6 +417,46 @@ def cancel_pending_deletes():
 
 def is_play_mode():
     return _play_mode_active
+
+
+# ── Sync-Health State (single source of truth for the panel) ─────────────
+
+def get_mute_reason():
+    """Why live outbound is muted right now, or None if it would flow.
+    MUST mirror on_depsgraph_update's gates exactly — the panel renders
+    this and the handler obeys the same conditions, so the UI can never
+    disagree with actual behavior."""
+    if _play_mode_active:
+        return "play mode"
+    try:
+        s = bpy.context.scene.sbox_bridge
+        if not s.auto_sync:
+            return "Auto Sync off"
+        if s.sync_mode == 'MANUAL':
+            return "Manual mode"
+    except Exception:
+        pass
+    return None
+
+
+def get_degraded_reason():
+    """Liveness assertion on the outbound pipeline's organs. This is the
+    ONLY check that catches a stripped depsgraph handler — heartbeats and
+    echo probes inject BELOW the handler, so a dead handler shows fresh
+    round-trips and an empty queue on every other indicator. That failure
+    class once took days to find; this makes it one red line."""
+    try:
+        if on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+            return "depsgraph handler missing"
+        if connection.is_connected():
+            if not bpy.app.timers.is_registered(_poll_and_process):
+                return "poll timer dead"
+            if (_first_dirty_time is not None
+                    and time.time() - _first_dirty_time > 5.0):
+                return "outbound flush stalled"
+    except Exception:
+        pass
+    return None
 
 
 # ── Outgoing: Blender -> s&box ──────────────────────────────────────────
@@ -799,6 +875,7 @@ def quarantine_scene_id(scene_id):
         for obj in bpy.data.objects:
             if obj.get("sbox_scene_id") == scene_id:
                 name = obj.name
+                obj["sbox_bridge_status"] = "quarantined"
                 break
     except Exception:
         pass
@@ -1875,16 +1952,22 @@ def _mark_dirty(kind, key, obj):
     """Queue an outbound send for the poll timer to flush. Last mark for a
     key wins — the flush reads the object's current state, so intermediate
     drag positions are never sent."""
+    global _first_dirty_time
+    if not _dirty_sends:
+        _first_dirty_time = time.time()
     _dirty_sends[key] = (kind, obj)
 
 
 def _flush_dirty_sends():
     """Drain the dirty-set. Runs from the poll timer, never from the
     depsgraph handler. Returns the number of entries drained."""
+    global _first_dirty_time
     if not _dirty_sends:
+        _first_dirty_time = None
         return 0
     pending = list(_dirty_sends.items())
     _dirty_sends.clear()
+    _first_dirty_time = None
     for key, (kind, obj) in pending:
         # Object may have been deleted between mark and flush.
         try:
@@ -2145,6 +2228,9 @@ def _poll_and_process():
         except Exception:
             pass
         if connection.is_reconnecting():
+            # Watchdog the retry organ itself — an unguarded bpy timer is
+            # exactly what silently died once before.
+            connection.ensure_reconnect_timer()
             return 0.5  # Keep timer alive during reconnect
         return None  # Stop timer — disconnected
 
@@ -2285,10 +2371,14 @@ def _check_deletions():
             current_ids.add(bid)
 
     deleted = _last_known_bridge_ids - current_ids
+    added = False
     for bid in deleted:
         # Don't add if already pending
         if not any(b == bid for b, _ in _pending_deletes):
             _pending_deletes.append((bid, time.time()))
+            added = True
+    if added:
+        connection.notify_ui()
 
     _last_known_bridge_ids = current_ids
 
@@ -2322,8 +2412,22 @@ def _check_hidden():
             log_activity(f"Unhidden: {obj.name} re-sent to s&box")
 
 
+_bulk_delete_warned = False
+
+
 def _confirm_pending_deletes():
-    """Auto-confirm pending deletes after timeout."""
+    """Auto-confirm pending deletes after timeout. Bulk deletions never
+    auto-confirm — they wait for the explicit Confirm Deletes button."""
+    global _bulk_delete_warned
+    if len(_pending_deletes) > PENDING_DELETE_BULK_GATE:
+        if not _bulk_delete_warned:
+            _bulk_delete_warned = True
+            add_warning(
+                f"{len(_pending_deletes)} deletes pending — bulk deletions "
+                "need Confirm Deletes in the panel (no auto-confirm)"
+            )
+        return
+    _bulk_delete_warned = False
     now = time.time()
     remaining = []
     for bid, timestamp in _pending_deletes:

@@ -4,12 +4,43 @@ Provides connect/disconnect, sync controls, grid, warnings, and material managem
 """
 
 import bpy
+import time
 import traceback
 from . import connection
 from . import sync
 
 
+_section_errors_printed = set()
+
+
+def _draw_section_error(layout, section, exc):
+    """A broken panel section must say so, not vanish. The old bare
+    'except: pass' made a crashed section invisible — indistinguishable from
+    'nothing to show', which is exactly how silent failures hide."""
+    try:
+        row = layout.row()
+        row.alert = True
+        row.label(text=f"{section} UI error — see console", icon="ERROR")
+        key = f"{section}:{exc}"
+        if key not in _section_errors_printed:
+            _section_errors_printed.add(key)
+            print(f"[s&box Bridge] Panel section '{section}' failed: {exc}")
+            traceback.print_exc()
+    except Exception:
+        pass
+
+
 # ── Operators ─────────────────────────────────────────────────────────────
+
+
+class SBOX_OT_ClearWarnings(bpy.types.Operator):
+    bl_idname = "sbox.bridge_clear_warnings"
+    bl_label = "Clear Warnings"
+    bl_description = "Dismiss all warnings (they remain in the activity log)"
+
+    def execute(self, context):
+        sync.clear_warnings()
+        return {"FINISHED"}
 
 class SBOX_OT_Connect(bpy.types.Operator):
     bl_idname = "sbox.bridge_connect"
@@ -61,17 +92,32 @@ class SBOX_OT_Connect(bpy.types.Operator):
                         )
             except Exception as e:
                 print(f"[s&box Bridge] get_project_info failed: {e}")
-            # Send unsynced Blender objects first, then request sync from s&box
+            # Do NOT auto-push untracked objects. Connecting used to
+            # mass-create every untracked mesh/light engine-side — open a
+            # donor kitbash file, hit Connect out of habit, and 300 source
+            # pieces flooded the engine scene (even in MANUAL mode). Now we
+            # only reconcile known state and REPORT what's unpushed.
+            untracked = 0
             for obj in list(bpy.data.objects):
                 if obj.get("sbox_scene_id") or obj.get("sbox_type"):
                     continue
                 if obj.type == "MESH" and not sync.get_bridge_id(obj):
-                    sync.send_create(obj)
+                    untracked += 1
                 elif obj.type == "LIGHT" and not sync.get_bridge_id(obj):
                     if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
-                        sync.send_create_light(obj)
+                        untracked += 1
             sync.send_sync()
-            self.report({"INFO"}, f"Connected to s&box at {settings.host}:{settings.port}")
+            if untracked:
+                sync.log_activity(
+                    f"Connected — {untracked} untracked object(s), "
+                    "use Sync All to push them"
+                )
+                self.report(
+                    {"INFO"},
+                    f"Connected — {untracked} untracked object(s), use Sync All to push",
+                )
+            else:
+                self.report({"INFO"}, f"Connected to s&box at {settings.host}:{settings.port}")
         else:
             settings.is_connected = False
             self.report({"ERROR"}, f"Failed to connect to {settings.host}:{settings.port}")
@@ -566,17 +612,53 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
         is_live = connection.is_connected()
         is_recon = connection.is_reconnecting()
 
-        # ── Connection ────────────────────────────────────────────
+        # ── Sync Health (always the first row — the trust line) ───
         try:
             box = layout.box()
             row = box.row()
             if is_live:
-                row.label(text="Status: Connected", icon="CHECKMARK")
+                # Order matters: a degraded organ outranks a mute (the mute
+                # might be a symptom), and both outrank the happy path.
+                degraded = sync.get_degraded_reason()
+                mute = sync.get_mute_reason()
+                if degraded:
+                    row.alert = True
+                    row.label(text=f"DEGRADED: {degraded}", icon="ERROR")
+                elif mute:
+                    row.label(text=f"MUTED: {mute}", icon="PAUSE")
+                else:
+                    row.label(text="LIVE", icon="CHECKMARK")
+
+                # Heartbeats, computed AT DRAW TIME — a dead timer can't
+                # fake these; the ages just keep growing.
+                sent_t, recv_t = connection.get_heartbeats()
+                now = time.time()
+
+                def _age(t):
+                    if not t:
+                        return "never"
+                    d = now - t
+                    if d < 10:
+                        return f"{d:.1f}s"
+                    if d < 60:
+                        return f"{d:.0f}s"
+                    return f"{d / 60:.0f}m"
+
+                queued = len(sync._dirty_sends)
+                sub = box.row()
+                sub.scale_y = 0.8
+                sub.label(
+                    text=f"sent {_age(sent_t)} ago · recv {_age(recv_t)} ago"
+                         f" · {queued} queued"
+                )
             elif is_recon:
+                row.alert = True
                 attempt = connection.get_reconnect_attempt()
-                row.label(text=f"Reconnecting... (attempt {attempt})", icon="SORTTIME")
+                row.label(
+                    text=f"RECONNECTING (attempt {attempt})", icon="SORTTIME"
+                )
             else:
-                row.label(text="Status: Disconnected", icon="ERROR")
+                row.label(text="DISCONNECTED", icon="ERROR")
 
             settings = context.scene.sbox_bridge
             col = box.column(align=True)
@@ -589,8 +671,8 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 row.operator("sbox.bridge_disconnect", icon="CANCEL")
             else:
                 row.operator("sbox.bridge_connect", icon="PLAY")
-        except Exception:
-            pass
+        except Exception as e:
+            _draw_section_error(layout, "Connection", e)
 
         layout.separator()
 
@@ -634,12 +716,16 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
             if context.collection and context.collection != context.scene.collection:
                 row = box.row()
                 row.operator("sbox.bridge_send_children", icon="OUTLINER_COLLECTION")
-        except Exception:
-            pass
+        except Exception as e:
+            _draw_section_error(layout, "Sync", e)
 
         layout.separator()
 
-        # ── Bridge Objects (status indicators) ────────────────────
+        # ── Bridge Objects — problems first ───────────────────────
+        # Panel real estate goes to what's BROKEN. Healthy objects collapse
+        # into the summary line; only failed/modified/unsent get rows. The
+        # old list spent 20 rows answering "what is fine?" — the only
+        # question worth pixels is "what needs me?".
         try:
             box = layout.box()
             box.label(text="Bridge Objects", icon="OBJECT_DATA")
@@ -649,16 +735,21 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 "synced": "CHECKMARK",
                 "modified": "FILE_REFRESH",
                 "received": "IMPORT",
+                "failed": "CANCEL",
+                "quarantined": "GHOST_ENABLED",
             }
             STATUS_NAMES = {
                 "unsent": "Not Sent",
                 "synced": "Synced",
                 "modified": "Modified",
                 "received": "Received",
+                "failed": "Failed",
+                "quarantined": "Quarantined",
             }
+            PROBLEM_ORDER = ["failed", "modified", "unsent"]
 
-            counts = {"unsent": 0, "synced": 0, "modified": 0, "received": 0}
-            bridge_objs = []
+            counts = {}
+            problems = []
 
             for obj in bpy.data.objects:
                 if obj.type not in ("MESH", "LIGHT"):
@@ -669,49 +760,32 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                     continue
 
                 status = sync.get_sync_status(obj)
-                bid = sync.get_bridge_id(obj)
-                if not bid:
+                if not sync.get_bridge_id(obj):
                     status = "unsent"
                 counts[status] = counts.get(status, 0) + 1
-                bridge_objs.append((obj.name, status))
+                if status in PROBLEM_ORDER:
+                    problems.append((obj.name, status))
 
-            # Summary row
             parts = []
-            for s in ["synced", "modified", "unsent", "received"]:
-                if counts[s] > 0:
+            for s in ["synced", "received", "modified", "unsent", "failed"]:
+                if counts.get(s, 0) > 0:
                     parts.append(f"{counts[s]} {STATUS_NAMES[s].lower()}")
-            if parts:
-                box.label(text="  ".join(parts))
+            box.label(text="  ".join(parts) if parts else "No bridge objects")
 
-            # Object list (max 20 shown)
-            import time as _time
-            now = _time.time()
-            for obj_name, status in bridge_objs[:20]:
+            problems.sort(key=lambda p: PROBLEM_ORDER.index(p[1]))
+            for obj_name, status in problems[:20]:
                 row = box.row(align=True)
-                icon = STATUS_ICONS.get(status, "QUESTION")
-
-                # Build label with relative time since last sync
-                obj_ref = bpy.data.objects.get(obj_name)
-                last_sync = obj_ref.get("sbox_bridge_last_sync", 0) if obj_ref else 0
-                if last_sync > 0:
-                    elapsed = now - last_sync
-                    if elapsed < 60:
-                        time_str = f"{elapsed:.0f}s ago"
-                    elif elapsed < 3600:
-                        time_str = f"{elapsed / 60:.0f}m ago"
-                    else:
-                        time_str = f"{elapsed / 3600:.1f}h ago"
-                    row.label(text=f"{obj_name}  ({time_str})", icon=icon)
-                else:
-                    row.label(text=obj_name, icon=icon)
-
-                op = row.operator("sbox.bridge_select_object", text="", icon="RESTRICT_SELECT_OFF")
+                if status == "failed":
+                    row.alert = True
+                row.label(text=obj_name, icon=STATUS_ICONS.get(status, "QUESTION"))
+                op = row.operator("sbox.bridge_select_object", text="",
+                                  icon="RESTRICT_SELECT_OFF")
                 op.obj_name = obj_name
 
-            if len(bridge_objs) > 20:
-                box.label(text=f"... and {len(bridge_objs) - 20} more")
-        except Exception:
-            pass
+            if len(problems) > 20:
+                box.label(text=f"... and {len(problems) - 20} more")
+        except Exception as e:
+            _draw_section_error(layout, "Bridge Objects", e)
 
         # ── Info ──────────────────────────────────────────────────
         try:
@@ -735,8 +809,8 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 row = box.row()
                 row.alert = True
                 row.label(text="s&box Play Mode Active", icon="PLAY")
-        except Exception:
-            pass
+        except Exception as e:
+            _draw_section_error(layout, "Info", e)
 
         # ── Pending Deletes ───────────────────────────────────────
         try:
@@ -751,22 +825,29 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 row = box.row(align=True)
                 row.operator("sbox.bridge_confirm_deletes", icon="CHECKMARK")
                 row.operator("sbox.bridge_cancel_deletes", icon="CANCEL")
-        except Exception:
-            pass
+        except Exception as e:
+            _draw_section_error(layout, "Pending Deletes", e)
 
-        # ── Warnings ──────────────────────────────────────────────
+        # ── Warnings — auto-expire from panel, one-click clear ────
+        # A warnings list that only ever grows trains the eye to ignore it.
+        # Entries older than 2 minutes drop from the panel (they stay in the
+        # activity log); the X dismisses everything now.
         try:
-            warnings = sync.get_warnings()
+            now = time.time()
+            warnings = [(t, m) for t, m in sync.get_warnings()
+                        if now - t < 120.0]
             if warnings:
                 layout.separator()
                 box = layout.box()
-                box.label(text="Warnings", icon="ERROR")
+                row = box.row()
+                row.label(text="Warnings", icon="ERROR")
+                row.operator("sbox.bridge_clear_warnings", text="", icon="X")
                 for timestamp, msg in warnings[-5:]:
                     row = box.row()
                     row.alert = True
                     row.label(text=msg, icon="DOT")
-        except Exception:
-            pass
+        except Exception as e:
+            _draw_section_error(layout, "Warnings", e)
 
         layout.separator()
 
@@ -797,8 +878,8 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                         row.label(text=f"[{time_str}] {msg}")
                 else:
                     box.label(text="No activity yet")
-        except Exception:
-            pass
+        except Exception as e:
+            _draw_section_error(layout, "Activity Log", e)
 
         layout.separator()
 
@@ -830,5 +911,5 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                     box.label(text="No materials generated yet")
             else:
                 box.label(text="Set Assets Path to manage materials")
-        except Exception:
-            pass
+        except Exception as e:
+            _draw_section_error(layout, "Materials", e)
