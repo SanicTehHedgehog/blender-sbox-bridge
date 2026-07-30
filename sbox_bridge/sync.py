@@ -26,7 +26,7 @@ import os
 import random
 import shutil
 import time
-from mathutils import Euler
+from mathutils import Euler, Matrix
 from . import connection
 
 
@@ -48,7 +48,7 @@ _last_transform_send = {}       # bridgeId -> time.time() of last transform send
 _mesh_debounce_obj = {}         # bridgeId -> obj reference
 _mesh_debounce_scheduled = set()
 _last_scale = {}                # bridgeId -> (sx, sy, sz)
-_hidden_bridge_ids = set()      # bridgeIds currently hidden in Blender (deleted from s&box)
+_hidden_bridge_ids = set()      # bridgeIds currently hidden in Blender (disabled in s&box)
 
 # Material caching
 _material_hash_cache = {}       # material_name -> (content_hash, vmat_rel_path)
@@ -80,6 +80,12 @@ _chunked_streams = {}           # bridgeId -> stream state dict
 
 # Play mode
 _play_mode_active = False
+
+# Set when we detect an engine session change, consumed by the next
+# sync_response: a fresh engine session that reports zero bridge objects
+# means "engine lost everything" — repopulate it from Blender instead of
+# leaving every local object holding a dead ID.
+_expect_fresh_engine = False
 
 # Per-Blender-session nonce for idempotency keys. Blender's session_uid
 # counter restarts every launch, so "name_uid" alone collides with keys the
@@ -117,6 +123,33 @@ def blender_to_sbox_pos(bx, by, bz):
 def sbox_to_blender_pos(sx, sy, sz):
     """s&box -> Blender: blender = (-sbox.Y, sbox.X, sbox.Z)"""
     return (-sy, sx, sz)
+
+
+# The position maps above are a +90° rotation about Z (and its inverse).
+# Rotations must ride through the SAME change of basis: R_blender =
+# AXIS_S2B @ R_sbox @ AXIS_B2S. Copying euler components across axes
+# (the old scheme) is only correct for pure-yaw rotations — a Blender
+# X=90° wall got pitch +90 where -90 is correct and stood upside down
+# in s&box, offset to the wrong side of its origin.
+_AXIS_S2B = Matrix.Rotation(math.radians(90.0), 3, 'Z')
+_AXIS_B2S = _AXIS_S2B.transposed()
+
+
+def _sbox_rotation_matrix(pitch_deg, yaw_deg, roll_deg):
+    """Wire pitch/yaw/roll -> Blender-frame 3x3 rotation.
+
+    s&box composes Rz(yaw) @ Ry(pitch) @ Rx(roll), which is exactly
+    Blender's 'XYZ' euler order with (x=roll, y=pitch, z=yaw). Building
+    the matrix first (instead of writing euler components) also makes the
+    result immune to the engine re-canonicalizing angle triples on echo:
+    equivalent triples produce the same matrix.
+    """
+    r_s = Euler((
+        math.radians(roll_deg),
+        math.radians(pitch_deg),
+        math.radians(yaw_deg),
+    ), 'XYZ').to_matrix()
+    return _AXIS_S2B @ r_s @ _AXIS_B2S
 
 
 # ── Bridge ID Helpers ────────────────────────────────────────────────────
@@ -160,6 +193,14 @@ def clear_bridge_id(obj):
     data = obj.data
     if data is not None and "sbox_bridge_id" in data and data.users <= 1:
         del data["sbox_bridge_id"]
+
+
+def _mint_bridge_id():
+    """Blender mints bridge IDs; the engine honors them on create (and
+    upserts when it already has the id). The .blend is the durable side of
+    the bridge — engine-minted IDs died with every unsaved engine scene,
+    reissuing identity on each reconnect and orphaning mesh caches."""
+    return "b_%08x" % random.getrandbits(32)
 
 
 def find_by_bridge_id(bridge_id):
@@ -221,6 +262,13 @@ def _get_scale_factor():
         return 1.0
 
 
+def _get_sync_on_connect():
+    try:
+        return bpy.context.scene.sbox_bridge.sync_on_connect
+    except Exception:
+        return False
+
+
 def _should_skip_object(obj):
     """Return True if this object should NOT be synced to s&box.
     Filters out hidden objects, cutters, and other non-visual objects."""
@@ -233,6 +281,9 @@ def _should_skip_object(obj):
             return True
     except Exception:
         pass
+    # Explicitly-ignored helpers (e.g. the player-scale reference box)
+    if obj.get("sbox_bridge_ignore"):
+        return True
     # Cutter/boolean objects (common in KitOps, HardOps, etc.)
     name_lower = obj.name.lower()
     if "cutter" in name_lower or "boolean" in name_lower:
@@ -462,8 +513,9 @@ def get_degraded_reason():
 # ── Outgoing: Blender -> s&box ──────────────────────────────────────────
 
 def send_create(obj):
-    """Send a create message. s&box assigns the bridge ID synchronously.
-    Detects paste duplicates and uses idempotency keys."""
+    """Send a create message. Blender mints the bridge ID and the engine
+    honors it (upserting if it already has that id), so identity survives
+    engine-session loss. Detects paste duplicates and uses idempotency keys."""
     global _blender_seq
 
     # Detect paste duplicate: another object has the same bridgeId
@@ -476,8 +528,10 @@ def send_create(obj):
                 bid = None
                 break
 
-    # If it already has a unique ID, don't create again
-    if get_bridge_id(obj):
+    # Engine already has this object — nothing to create. An id the engine
+    # DOESN'T know is kept and re-sent under the same identity (fresh engine
+    # session, restored from Bridge Trash, "not found" recovery).
+    if bid and bid in _last_known_bridge_ids:
         return
 
     # Skip hidden/cutter objects
@@ -502,12 +556,18 @@ def send_create(obj):
         geo_hash = geometry_hash(obj)
         hierarchy = get_collection_path(obj)
 
+        # Reuse the object's existing id (re-create under the same identity)
+        # or mint a fresh one. The engine honors it.
+        if not bid:
+            bid = _mint_bridge_id()
+
         _blender_seq += 1
         msg = {
             "type": "create",
             "seq": _blender_seq,
             "ack": _last_sbox_seq_processed,
             "name": obj.name,
+            "bridgeId": bid,
             "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
             "rotation": _rotation_to_sbox(obj),
             "meshData": mesh_data,
@@ -517,6 +577,19 @@ def send_create(obj):
         }
 
         response = connection.send_and_receive(msg)
+        if response and "bridgeId" in response:
+            rbid = response["bridgeId"]
+            if any(other is not obj and get_bridge_id(other) == rbid
+                   for other in bpy.data.objects):
+                # Idempotency echo returned an id ANOTHER object already
+                # holds. Happens when a duplicate stole this object's id and
+                # this is the re-create: same key -> same old id -> the pair
+                # collides again next tick, forever ("Created: X -> b_..."
+                # spam). Salt the key and retry once to force a new object.
+                _blender_seq += 1
+                msg["seq"] = _blender_seq
+                msg["idempotencyKey"] = f"{idem_key}_r{random.getrandbits(16):04x}"
+                response = connection.send_and_receive(msg)
         if response and "bridgeId" in response:
             set_bridge_id(obj, response["bridgeId"])
             obj["sbox_bridge_name"] = obj.name
@@ -576,11 +649,19 @@ def send_update_mesh(obj):
     if not bridge_id:
         return
 
-    # Hash check — skip if geometry hasn't actually changed
+    # Hash check — skip the heavy mesh payload if geometry hasn't changed.
+    # But NOT the transform: moving an object with generative modifiers
+    # (Array, Mirror, booleans) fires is_updated_geometry, so the move gets
+    # routed down THIS path — a bare return here swallows it. That was why
+    # arrayed walls ignored moves/rotations until a count change forced a
+    # real geometry resync, dupes of arrays "never appeared" (they spawned
+    # inside the original and their move was eaten), and long sessions
+    # drifted out of alignment.
     geo_hash = geometry_hash(obj)
     stored = get_stored_hash(obj)
     if geo_hash and stored and geo_hash == stored:
-        return  # No actual geometry change
+        send_update_transform(obj, force=True)
+        return
 
     sf = _get_scale_factor()
     mesh_data = _extract_mesh_data(obj, sf)
@@ -744,6 +825,22 @@ def send_delete(bridge_id):
     log_activity(f"Sent delete: {bridge_id}")
 
 
+def send_visibility(bridge_id, visible):
+    """Toggle the engine-side GameObject's Enabled state. Used for Blender
+    hide/unhide — the object keeps its bridge ID, mesh, and materials, unlike
+    the old delete/re-create cycle which lost engine-side texture work."""
+    global _blender_seq
+    _blender_seq += 1
+    msg = {
+        "type": "set_visibility",
+        "seq": _blender_seq,
+        "ack": _last_sbox_seq_processed,
+        "bridgeId": bridge_id,
+        "visible": bool(visible),
+    }
+    connection.send(msg)
+
+
 def send_sync():
     """Request full sync from s&box, including our known object list."""
     global _blender_seq
@@ -801,6 +898,14 @@ def send_create_light(obj):
     light_type_map = {"POINT": "point", "SPOT": "spot", "SUN": "directional"}
     sbox_light_type = light_type_map.get(obj.data.type, "point")
 
+    # Same ID policy as send_create: reuse or mint; skip only when the
+    # engine is known to already have it.
+    bid = get_bridge_id(obj)
+    if bid and bid in _last_known_bridge_ids:
+        return
+    if not bid:
+        bid = _mint_bridge_id()
+
     sf = _get_scale_factor()
     wp = obj.matrix_world.to_translation()
     px, py, pz = blender_to_sbox_pos(wp.x, wp.y, wp.z)
@@ -813,6 +918,7 @@ def send_create_light(obj):
         "seq": _blender_seq,
         "ack": _last_sbox_seq_processed,
         "name": obj.name,
+        "bridgeId": bid,
         "lightType": sbox_light_type,
         "position": {"x": px * sf, "y": py * sf, "z": pz * sf},
         "rotation": _rotation_to_sbox(obj),
@@ -823,6 +929,7 @@ def send_create_light(obj):
     response = connection.send_and_receive(msg)
     if response and "bridgeId" in response:
         set_bridge_id(obj, response["bridgeId"])
+        obj["sbox_bridge_name"] = obj.name
         _last_write_seq[response["bridgeId"]] = _blender_seq
         _last_known_bridge_ids.add(response["bridgeId"])
         log_activity(f"Created light: {obj.name} -> {response['bridgeId']}")
@@ -1042,17 +1149,142 @@ def _handle_object_created(msg):
 
 
 def _handle_deleted(msg):
-    """s&box deleted a bridge object."""
+    """s&box deleted a bridge object. NEVER hard-delete the Blender
+    counterpart — quarantine it in Bridge Trash and wait for explicit
+    Confirm/Restore in the panel. Blender is the source of truth; one bad
+    engine-side action must not be able to eat modeling work."""
     bridge_id = msg.get("bridgeId")
     if not bridge_id:
         return
+    if not _quarantine_inbound_delete(bridge_id, "live delete"):
+        log_activity(f"Deleted from s&box: {bridge_id} (no local object)")
 
-    obj = find_by_bridge_id(bridge_id)
-    if obj:
-        bpy.data.objects.remove(obj, do_unlink=True)
+
+# ── Inbound Delete Quarantine (Bridge Trash) ────────────────────────────
+
+TRASH_COLLECTION_NAME = "Bridge Trash (s&box deletes)"
+
+# bridgeId -> {"name": str, "time": float, "collections": [str]}
+_inbound_pending_deletes = {}
+
+
+def get_inbound_pending_deletes():
+    return dict(_inbound_pending_deletes)
+
+
+def _get_or_create_trash_collection():
+    col = bpy.data.collections.get(TRASH_COLLECTION_NAME)
+    if col is None:
+        col = bpy.data.collections.new(TRASH_COLLECTION_NAME)
+    try:
+        if col.name not in bpy.context.scene.collection.children:
+            bpy.context.scene.collection.children.link(col)
+    except Exception:
+        pass
+    col.hide_viewport = True
+    col.hide_render = True
+    return col
+
+
+def _quarantine_inbound_delete(bridge_id, source):
+    """Move the object to the hidden Bridge Trash collection instead of
+    deleting it. Returns True if a local object was quarantined."""
     _last_known_bridge_ids.discard(bridge_id)
     _last_write_seq.pop(bridge_id, None)
-    log_activity(f"Deleted from s&box: {bridge_id}")
+    obj = find_by_bridge_id(bridge_id)
+    if obj is None:
+        return False
+    if bridge_id in _inbound_pending_deletes:
+        return True
+
+    original_cols = [c.name for c in obj.users_collection
+                     if c.name != TRASH_COLLECTION_NAME]
+    trash = _get_or_create_trash_collection()
+    for c in list(obj.users_collection):
+        try:
+            c.objects.unlink(obj)
+        except Exception:
+            pass
+    if obj.name not in trash.objects:
+        trash.objects.link(obj)
+
+    _inbound_pending_deletes[bridge_id] = {
+        "name": obj.name,
+        "time": time.time(),
+        "collections": original_cols,
+    }
+    log_activity(f"s&box deleted '{obj.name}' ({source}) — held in Bridge Trash")
+    add_warning(
+        f"s&box deleted '{obj.name}' — held in Bridge Trash. "
+        "Confirm or Restore in the panel."
+    )
+    return True
+
+
+def confirm_inbound_deletes():
+    """Permanently delete everything held in Bridge Trash."""
+    count = 0
+    for bid in list(_inbound_pending_deletes.keys()):
+        obj = find_by_bridge_id(bid)
+        if obj is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        _inbound_pending_deletes.pop(bid, None)
+        count += 1
+    _remove_trash_if_empty()
+    log_activity(f"Confirmed {count} s&box delete(s)")
+    connection.notify_ui()
+    return count
+
+
+def restore_inbound_deletes():
+    """Bring trashed objects back into their original collections and queue
+    re-creates. IDs are kept — the engine honors Blender-minted ids — so
+    each object comes back to s&box under its original identity."""
+    count = 0
+    for bid in list(_inbound_pending_deletes.keys()):
+        info = _inbound_pending_deletes.pop(bid)
+        obj = find_by_bridge_id(bid)
+        if obj is None:
+            continue
+        trash = bpy.data.collections.get(TRASH_COLLECTION_NAME)
+        if trash is not None and obj.name in trash.objects:
+            try:
+                trash.objects.unlink(obj)
+            except Exception:
+                pass
+        linked = False
+        for cname in info.get("collections", []):
+            col = bpy.data.collections.get(cname)
+            if col is not None:
+                try:
+                    col.objects.link(obj)
+                    linked = True
+                except Exception:
+                    pass
+        if not linked:
+            try:
+                bpy.context.scene.collection.objects.link(obj)
+            except Exception:
+                pass
+        uid = getattr(obj, "session_uid", id(obj))
+        if obj.type == "MESH":
+            _mark_dirty("create", f"create_{uid}", obj)
+        elif obj.type == "LIGHT":
+            _mark_dirty("create_light", f"create_{uid}", obj)
+        count += 1
+    _remove_trash_if_empty()
+    log_activity(f"Restored {count} object(s) from Bridge Trash — re-sending to s&box")
+    connection.notify_ui()
+    return count
+
+
+def _remove_trash_if_empty():
+    col = bpy.data.collections.get(TRASH_COLLECTION_NAME)
+    if col is not None and not col.objects and not _inbound_pending_deletes:
+        try:
+            bpy.data.collections.remove(col)
+        except Exception:
+            pass
 
 
 def _handle_scene_updated(msg):
@@ -1112,15 +1344,15 @@ def _handle_sync_response(msg):
         if bid:
             local_ids.add(bid)
 
+    inline_delete_bids = []
     for obj_data in objects:
-        # Handle inline deletes from reconciliation
+        # Inline deletes from reconciliation: collect only — handled after the
+        # loop, once received_ids tells us whether the engine actually has
+        # state or is a fresh session that lost everything.
         if obj_data.get("type") == "deleted":
             bid = obj_data.get("bridgeId")
             if bid:
-                existing = find_by_bridge_id(bid)
-                if existing:
-                    bpy.data.objects.remove(existing, do_unlink=True)
-                _last_known_bridge_ids.discard(bid)
+                inline_delete_bids.append(bid)
             continue
 
         bridge_id = obj_data.get("bridgeId")
@@ -1148,12 +1380,59 @@ def _handle_sync_response(msg):
             # (Skip if Blender had this ID before processing, meaning we just sent it)
             _create_from_sbox(obj_data)
 
-    # Reconcile: remove stale objects that s&box no longer has
+    # Engine-reported-stale handling. NEVER hard-delete Blender objects here:
+    # a fresh engine session (restart, unsaved engine scene) legitimately
+    # knows nothing — hard-deleting ate user scenes on every engine restart.
+    #
+    # Two distinct cases:
+    #  - Fresh engine session with zero bridge objects: repopulate it from
+    #    Blender. IDs are KEPT — the engine honors Blender-minted ids on
+    #    create — so the scene comes back under the same identities (mesh
+    #    caches and references stay valid).
+    #  - Engine HAS state and explicitly reports ids deleted: route through
+    #    the same Bridge Trash quarantine as live 'deleted' messages.
+    global _expect_fresh_engine
+    expect_fresh = _expect_fresh_engine
+    _expect_fresh_engine = False
+    engine_is_empty = not received_ids
+
+    if engine_is_empty and expect_fresh:
+        requeued = 0
+        for obj in list(bpy.data.objects):
+            bid = get_bridge_id(obj)
+            if not bid or bid in _inbound_pending_deletes:
+                continue
+            _last_known_bridge_ids.discard(bid)
+            if _should_skip_object(obj):
+                continue
+            uid = getattr(obj, "session_uid", id(obj))
+            if obj.type == "MESH":
+                _mark_dirty("create", f"create_{uid}", obj)
+                requeued += 1
+            elif obj.type == "LIGHT":
+                if obj.data and obj.data.type not in UNSUPPORTED_LIGHT_TYPES:
+                    _mark_dirty("create_light", f"create_{uid}", obj)
+                    requeued += 1
+        if requeued:
+            log_activity(
+                f"Engine session is empty — re-sending {requeued} object(s) "
+                "under their existing IDs"
+            )
+    else:
+        for bid in inline_delete_bids:
+            _quarantine_inbound_delete(bid, "sync reconcile")
+
+    # Ids we thought the engine had but this sync didn't report (partial
+    # loss, scene-tab switch). KEEP the Blender-side ids — the engine honors
+    # them on re-create — just drop them from the engine-known set and tell
+    # the user; Sync All re-sends them under the same identity.
     stale = _last_known_bridge_ids - received_ids
-    for bid in stale:
-        obj = find_by_bridge_id(bid)
-        if obj:
-            _strip_bridge_props(obj)
+    stale -= set(_inbound_pending_deletes)
+    if stale and not engine_is_empty:
+        add_warning(
+            f"{len(stale)} object(s) not reported by s&box — kept in Blender. "
+            "Sync All re-sends them under the same IDs."
+        )
 
     _last_known_bridge_ids = received_ids.copy()
 
@@ -1173,6 +1452,21 @@ def _create_from_sbox(msg):
 
     sf = _get_scale_factor()
     inv_sf = 1.0 / sf if sf else 1.0
+
+    # Engine-side duplicate (shift-drag/Ctrl+D re-tagged by the scan). The
+    # wire meshData is geometry-only — building from it makes a BARE copy
+    # that loses materials/UVs, and the bare copy's first edit then echoed a
+    # material-less mesh back and wiped the ENGINE object's textures too.
+    # Clone our own copy of the source object instead: identical geometry
+    # plus full materials, UVs, and per-face assignments.
+    src_bid = msg.get("sourceBridgeId")
+    if src_bid:
+        src = find_by_bridge_id(src_bid)
+        if src is not None and src.type == 'MESH' and src.data is not None:
+            obj = bpy.data.objects.new(name, src.data.copy())
+            _finish_create_from_sbox(obj, msg, bridge_id, name)
+            log_activity(f"Created from s&box dup of {src_bid}: {name} ({bridge_id})")
+            return
 
     if mesh_data and mesh_data.get("vertices") and len(mesh_data["vertices"]) >= 9:
         raw_verts = mesh_data["vertices"]
@@ -1215,6 +1509,12 @@ def _create_from_sbox(msg):
         mesh = bpy.data.meshes.new(f"{name}_mesh")
         obj = bpy.data.objects.new(name, mesh)
 
+    _finish_create_from_sbox(obj, msg, bridge_id, name)
+    log_activity(f"Created from s&box: {name} ({bridge_id})")
+
+
+def _finish_create_from_sbox(obj, msg, bridge_id, name):
+    """Shared tail of _create_from_sbox: link, identify, place, and baseline."""
     # Link to collection based on hierarchy (if provided) or default
     hierarchy = msg.get("hierarchy", [])
     if hierarchy:
@@ -1230,7 +1530,17 @@ def _create_from_sbox(msg):
         _last_known_bridge_ids.add(bridge_id)
 
     _apply_sbox_transform(obj, msg)
-    log_activity(f"Created from s&box: {name} ({bridge_id})")
+
+    # Baseline the change-detection state AFTER the transform (the hash
+    # includes scale). Without this, the depsgraph event fired by our own
+    # creation read as a user edit and immediately re-sent the object's
+    # mesh — material-less — back to the engine, stripping its textures.
+    try:
+        set_stored_hash(obj, geometry_hash(obj))
+        if bridge_id:
+            _last_scale[bridge_id] = tuple(round(s, 4) for s in obj.scale)
+    except Exception:
+        pass
 
 
 def _rebuild_mesh(obj, mesh_data):
@@ -1337,6 +1647,7 @@ def _create_light(msg):
 
     if bridge_id:
         obj["sbox_bridge_id"] = bridge_id
+        obj["sbox_bridge_name"] = obj.name
         _last_known_bridge_ids.add(bridge_id)
     if scene_id:
         obj["sbox_scene_id"] = scene_id
@@ -1787,6 +2098,9 @@ def _generate_vmat_and_copy_textures(mat_data):
     if color_ref:
         r = g = b = 1.0
 
+    em_str = mat_data.get("emissionStrength", 0.0)
+    has_emission = em_str > 0.001
+
     lines = [
         "// AUTO-GENERATED BY BLENDER BRIDGE",
         "",
@@ -1799,6 +2113,10 @@ def _generate_vmat_and_copy_textures(mat_data):
 
     if metal_ref:
         lines.append("\tF_METALNESS_TEXTURE 1")
+    if has_emission:
+        # Without this feature flag the complex shader silently ignores every
+        # g_*SelfIllum* parameter — emission looked like it "did nothing".
+        lines.append("\tF_SELF_ILLUM 1")
 
     lines.append("")
     lines.append(f'\tg_flModelTintAmount "1.000"')
@@ -1820,15 +2138,20 @@ def _generate_vmat_and_copy_textures(mat_data):
         lines.append("")
         lines.append(f'\tTextureNormal "{normal_ref}"')
 
-    em_str = mat_data.get("emissionStrength", 0.0)
-    if em_str > 0.001:
+    if has_emission:
         ec = mat_data.get("emissionColor", [0, 0, 0])
         er = ec[0]
         eg = ec[1] if len(ec) > 1 else 0
         eb = ec[2] if len(ec) > 2 else 0
+        # Blender parity: emission is its own color independent of albedo, so
+        # AlbedoFactor 0, Tint = Emission Color, Scale = Emission Strength,
+        # inline white mask (whole surface glows, like Blender's shader).
         lines.append("")
-        lines.append(f'\tg_vSelfIllumTint "[{er:.6f} {eg:.6f} {eb:.6f} 0.000000]"')
+        lines.append('\tg_flSelfIllumAlbedoFactor "0.000"')
+        lines.append('\tg_flSelfIllumBrightness "0.000"')
         lines.append(f'\tg_flSelfIllumScale "{em_str:.3f}"')
+        lines.append(f'\tg_vSelfIllumTint "[{er:.6f} {eg:.6f} {eb:.6f} 0.000000]"')
+        lines.append('\tTextureSelfIllumMask "[1.000000 1.000000 1.000000 0.000000]"')
 
     lines.append("")
     lines.append('\tg_vTexCoordScale "[1.000 1.000]"')
@@ -1878,13 +2201,19 @@ def _rotation_to_sbox(obj):
     the SIGNED scale _extract_mesh_data bakes into the vertices. to_euler()
     reads the un-fixed improper matrix and returns a rotation ~180° away
     from that pairing, which mis-orients every mirrored object in s&box.
-    For normal matrices the two are identical."""
+    For normal matrices the two are identical.
+
+    Conjugate through the axis change (R_s = AXIS_B2S @ R_b @ AXIS_S2B)
+    and read the s&box triple off the 'XYZ' euler of the result — s&box's
+    Rz(yaw) @ Ry(pitch) @ Rx(roll) is 'XYZ' order with (roll, pitch, yaw).
+    See _sbox_rotation_matrix, the exact inverse of this."""
     _, rq, _ = obj.matrix_world.decompose()
-    we = rq.to_euler()
+    r_s = _AXIS_B2S @ rq.to_matrix() @ _AXIS_S2B
+    e = r_s.to_euler('XYZ')
     return {
-        "pitch": math.degrees(we.x),
-        "yaw": math.degrees(we.z),
-        "roll": math.degrees(we.y),
+        "pitch": math.degrees(e.y),
+        "yaw": math.degrees(e.z),
+        "roll": math.degrees(e.x),
     }
 
 
@@ -1901,16 +2230,14 @@ def _apply_sbox_transform(obj, msg):
         )
         new_loc = (bx * inv_sf, by * inv_sf, bz * inv_sf)
 
-    new_rot = None
+    new_quat = None
     if "rotation" in msg:
         r = msg["rotation"]
-        new_rot = (
-            math.radians(r.get("pitch", 0.0)),
-            math.radians(r.get("roll", 0.0)),
-            math.radians(r.get("yaw", 0.0)),
-        )
+        new_quat = _sbox_rotation_matrix(
+            r.get("pitch", 0.0), r.get("yaw", 0.0), r.get("roll", 0.0)
+        ).to_quaternion()
 
-    if new_rot is not None and obj.matrix_world.determinant() < 0:
+    if new_quat is not None and obj.matrix_world.determinant() < 0:
         # Reflected (mirrored) object. The wire rotation pairs with the signed
         # scale that decompose() spreads across all three axes — writing it
         # straight into rotation_euler would pair it with the object's local
@@ -1921,8 +2248,7 @@ def _apply_sbox_transform(obj, msg):
         # matrix_world until the next depsgraph evaluation.
         m = obj.matrix_world.copy()
         _, current_q, _ = m.decompose()
-        target_q = Euler(new_rot, 'XYZ').to_quaternion()
-        delta = target_q @ current_q.inverted()
+        delta = new_quat @ current_q.inverted()
         new_m = (delta.to_matrix() @ m.to_3x3()).to_4x4()
         new_m.translation = new_loc if new_loc is not None else m.to_translation()
         obj.matrix_world = new_m
@@ -1930,8 +2256,16 @@ def _apply_sbox_transform(obj, msg):
 
     if new_loc is not None:
         obj.location = new_loc
-    if new_rot is not None:
-        obj.rotation_euler = new_rot
+    if new_quat is not None:
+        if obj.rotation_mode == 'QUATERNION':
+            obj.rotation_quaternion = new_quat
+        else:
+            try:
+                obj.rotation_euler = new_quat.to_euler(obj.rotation_mode)
+            except ValueError:
+                # AXIS_ANGLE mode isn't a euler order — fall back to XYZ,
+                # matching the old behavior for that mode.
+                obj.rotation_euler = new_quat.to_euler('XYZ')
 
 
 # ── Depsgraph Handler ───────────────────────────────────────────────────
@@ -1958,6 +2292,15 @@ def _mark_dirty(kind, key, obj):
     _dirty_sends[key] = (kind, obj)
 
 
+# At most this many creates (full mesh extraction + material generation +
+# blocking send_and_receive each) go out per flush tick. A fresh-engine
+# repopulate queues the ENTIRE scene at once; unthrottled, Blender froze
+# for the whole batch ("lots of objects cause issues on connect"). The
+# remainder stays queued and trickles out on subsequent ticks — everything
+# still arrives, just without the freeze.
+HEAVY_SENDS_PER_FLUSH = 3
+
+
 def _flush_dirty_sends():
     """Drain the dirty-set. Runs from the poll timer, never from the
     depsgraph handler. Returns the number of entries drained."""
@@ -1968,10 +2311,21 @@ def _flush_dirty_sends():
     pending = list(_dirty_sends.items())
     _dirty_sends.clear()
     _first_dirty_time = None
+    heavy_budget = HEAVY_SENDS_PER_FLUSH
+    deferred = {}
     for key, (kind, obj) in pending:
+        if kind in ("create", "create_light") and heavy_budget <= 0:
+            deferred[key] = (kind, obj)
+            continue
         # Object may have been deleted between mark and flush.
         try:
             if obj is None or not obj.name:
+                continue
+            # Held in Bridge Trash — nothing goes out for it. (Restore pops
+            # the quarantine entry BEFORE queuing its re-create, so restored
+            # objects pass this check.)
+            _bid = get_bridge_id(obj)
+            if _bid and _bid in _inbound_pending_deletes:
                 continue
         except ReferenceError:
             continue
@@ -1983,18 +2337,28 @@ def _flush_dirty_sends():
             elif kind == "scene":
                 send_scene_transform(obj, force=True)
             elif kind == "create":
-                # Re-check: a flush in between (or _check_duplicates) may
-                # already have created it.
-                if not get_bridge_id(obj):
-                    send_create(obj)
+                # send_create itself skips ids the engine already has.
+                # Objects now KEEP their id across engine sessions, so a
+                # bare "has id -> skip" here would block every re-create
+                # (restore-from-trash, fresh-engine repopulate, not-found
+                # recovery).
+                send_create(obj)
+                heavy_budget -= 1
             elif kind == "create_light":
-                if not get_bridge_id(obj):
-                    send_create_light(obj)
+                send_create_light(obj)
+                heavy_budget -= 1
         except ReferenceError:
             continue
         except Exception as e:
             print(f"[Bridge] Deferred send failed ({kind}, {key}): {e}")
-    return len(pending)
+    if deferred:
+        # Newer marks made during this flush win over the deferred entries.
+        for k, v in deferred.items():
+            _dirty_sends.setdefault(k, v)
+        # Restart the stall canary — this backlog is intentional pacing,
+        # not a dead flush.
+        _first_dirty_time = time.time()
+    return len(pending) - len(deferred)
 
 
 @persistent
@@ -2116,6 +2480,22 @@ def on_depsgraph_update(scene, depsgraph):
                 continue
             bridge_id = get_bridge_id(obj)
             if bridge_id:
+                # Same stolen-ID window as meshes: a duplicated light drives
+                # the source's engine light until the sweep re-keys it.
+                stamp = obj.get("sbox_bridge_name")
+                if stamp is not None and stamp != obj.name:
+                    owner = None
+                    for other in bpy.data.objects:
+                        if other is not obj and get_bridge_id(other) == bridge_id:
+                            owner = other
+                            break
+                    if owner is not None:
+                        _strip_bridge_props(obj)
+                        uid = getattr(obj, "session_uid", id(obj))
+                        _mark_dirty("create_light", f"create_{uid}", obj)
+                        _mark_dirty("light", bridge_id, owner)
+                        continue
+                    obj["sbox_bridge_name"] = obj.name
                 _mark_dirty("light", bridge_id, obj)
             elif not obj.get("sbox_scene_id"):
                 uid = getattr(obj, "session_uid", id(obj))
@@ -2134,6 +2514,32 @@ def on_depsgraph_update(scene, depsgraph):
         bridge_id = get_bridge_id(obj)
 
         if bridge_id:
+            # A fresh duplicate carries the SOURCE's ID until the 100ms
+            # duplicate sweep re-keys it — transforms sent in that window move
+            # the source's engine object (the original visibly twitches while
+            # you drag the copy, then rests slightly off). A copy's
+            # sbox_bridge_name stamp doesn't match its own name — that's the
+            # cheap tell; confirm with a scan before touching the wire.
+            stamp = obj.get("sbox_bridge_name")
+            if stamp is not None and stamp != obj.name:
+                owner = None
+                for other in bpy.data.objects:
+                    if other is not obj and get_bridge_id(other) == bridge_id:
+                        owner = other
+                        break
+                if owner is not None:
+                    # This is the copy: re-key it now, never send under the
+                    # stolen ID, and correct the source in case stray moves
+                    # already landed on its engine object.
+                    _strip_bridge_props(obj)
+                    uid = getattr(obj, "session_uid", id(obj))
+                    _mark_dirty("create", f"create_{uid}", obj)
+                    _mark_dirty("transform", bridge_id, owner)
+                    continue
+                # No other holder — the object was just renamed. Adopt the
+                # new name so this scan doesn't rerun every event.
+                obj["sbox_bridge_name"] = obj.name
+
             # Read scale from the evaluated copy (update.id) since .original
             # may not have the updated scale during interactive transforms
             eval_scale = tuple(round(s, 4) for s in update.id.scale)
@@ -2271,6 +2677,8 @@ def _poll_and_process():
         # Detect session change (s&box restarted or hot-reloaded)
         session_id = response.get("sessionId")
         if session_id and session_id != _current_session_id:
+            global _expect_fresh_engine
+            _expect_fresh_engine = True
             _current_session_id = session_id
             _last_write_seq.clear()
             _last_sbox_seq_processed = 0
@@ -2278,8 +2686,15 @@ def _poll_and_process():
             # New session knows nothing about our grid — clear the echo guard
             # so the next grid change (either direction) always goes through.
             _last_grid_sent = None
-            log_activity(f"Session changed to {session_id}, resyncing...")
-            send_sync()
+            if _get_sync_on_connect():
+                log_activity(f"Session changed to {session_id}, resyncing...")
+                send_sync()
+            else:
+                log_activity(f"Session changed to {session_id}")
+                add_warning(
+                    "Engine session changed — press Sync All to reconcile "
+                    "(auto-sync on connect is off)"
+                )
             return 0.1
 
         msgs = response.get("messages", [])
@@ -2343,14 +2758,38 @@ def _check_duplicates():
         bid = obj.get("sbox_bridge_id")
         if not bid:
             continue
+        # Trashed objects keep their id but are inert — don't let them win
+        # (or lose) a duplicate-id fight with a live object.
+        if bid in _inbound_pending_deletes:
+            continue
         if bid in seen:
-            _strip_bridge_props(obj)
-            if obj.type == "MESH":
-                send_create(obj)
-            elif obj.type == "LIGHT":
-                send_create_light(obj)
+            # Two objects claim one id. Decide which is the ORIGINAL owner:
+            # iteration order is alphabetical and Blender's gap-filling names
+            # can make the copy sort FIRST (dupe of Cube.017 becomes
+            # Cube.013), so first-wins would keep the copy and strip the
+            # original — whose idempotent re-create returns the SAME id and
+            # the pair collides again forever. The create stamps
+            # sbox_bridge_name; the object whose stamp matches its own name
+            # is the original.
+            keep, strip = seen[bid], obj
+            keep_owns = keep.get("sbox_bridge_name") == keep.name
+            obj_owns = obj.get("sbox_bridge_name") == obj.name
+            if obj_owns and not keep_owns:
+                keep, strip = obj, seen[bid]
+                seen[bid] = keep
+            _strip_bridge_props(strip)
+            if strip.type == "MESH":
+                send_create(strip)
+            elif strip.type == "LIGHT":
+                send_create_light(strip)
+            # The keeper's engine object may have eaten stray moves while the
+            # copy still carried its ID — re-send its true transform.
+            if keep.type == "MESH":
+                _mark_dirty("transform", bid, keep)
+            elif keep.type == "LIGHT":
+                _mark_dirty("light", bid, keep)
         else:
-            seen[bid] = obj.name
+            seen[bid] = obj
 
 
 def _check_deletions():
@@ -2367,7 +2806,11 @@ def _check_deletions():
         # lost (undo) but is still recoverable via its data mirror gets a
         # spurious delete sent for it.
         bid = get_bridge_id(obj)
-        if bid:
+        # Quarantined objects keep their bid but must stay OUT of the
+        # engine-known set: re-adding them here would (a) fire an outbound
+        # delete when the user confirms the trash, and (b) make send_create
+        # skip the re-create when the user restores it.
+        if bid and bid not in _inbound_pending_deletes:
             current_ids.add(bid)
 
     deleted = _last_known_bridge_ids - current_ids
@@ -2392,24 +2835,39 @@ def _check_hidden():
         bid = get_bridge_id(obj)
         if not bid:
             continue
+        # Bridge Trash is a hidden collection — without this, quarantine
+        # would fire set_visibility at an engine object that no longer exists.
+        if bid in _inbound_pending_deletes:
+            continue
 
         is_hidden = _should_skip_object(obj)
 
         if is_hidden and bid not in _hidden_bridge_ids:
-            # Just became hidden — delete from s&box
+            # Just became hidden — disable in s&box. NOT a delete: destroying
+            # the GameObject threw away engine-side material/texture work and
+            # forced a full mesh rebuild on unhide.
             _hidden_bridge_ids.add(bid)
-            send_delete(bid)
-            log_activity(f"Hidden: {obj.name} removed from s&box")
+            send_visibility(bid, False)
+            log_activity(f"Hidden: {obj.name} disabled in s&box")
 
         elif not is_hidden and bid in _hidden_bridge_ids:
-            # Just became visible again — re-send to s&box
+            # Just became visible again — re-enable the same engine object.
             _hidden_bridge_ids.discard(bid)
-            _strip_bridge_props(obj)
-            if obj.type == "MESH":
-                send_create(obj)
-            elif obj.type == "LIGHT":
-                send_create_light(obj)
-            log_activity(f"Unhidden: {obj.name} re-sent to s&box")
+            send_visibility(bid, True)
+            # Catch up edits made while hidden: the depsgraph handler skips
+            # hidden objects, so anything changed in between never went out.
+            try:
+                if obj.type == "MESH":
+                    if geometry_hash(obj) != get_stored_hash(obj):
+                        set_sync_status(obj, "modified")
+                        _schedule_mesh_update(bid, obj)
+                    else:
+                        _mark_dirty("transform", bid, obj)
+                elif obj.type == "LIGHT":
+                    _mark_dirty("light", bid, obj)
+            except Exception:
+                pass
+            log_activity(f"Unhidden: {obj.name} re-enabled in s&box")
 
 
 _bulk_delete_warned = False

@@ -166,8 +166,10 @@ This also happens during `HandleSync` for first-connect reconciliation.
 ### Hiding objects in Blender
 
 `_check_hidden()` runs every poll cycle (100ms):
-- If a bridge object becomes hidden → sends `delete` to s&box
-- If it becomes visible again → strips bridge props and re-creates it
+- If a bridge object becomes hidden → sends `set_visibility` (visible=false); the engine sets `GameObject.Enabled = false` — same object, materials and mesh preserved
+- If it becomes visible again → sends `set_visibility` (visible=true), then catches up anything edited while hidden (mesh re-send only if the geometry hash changed, otherwise just a transform update)
+
+(Pre-2026-07-29 behavior was delete + re-create, which destroyed engine-side material/texture assignments and forced a full mesh rebuild on every unhide.)
 
 ### Deleting objects
 

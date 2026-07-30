@@ -6,6 +6,7 @@ Uses Python stdlib only (http.client, json).
 
 import http.client
 import json
+import threading
 import time
 import traceback
 
@@ -178,7 +179,21 @@ def _surface_engine_error(sent_json, body):
                     from . import sync
                     obj = sync.find_by_bridge_id(bid)
                     if obj is not None:
-                        sync.set_sync_status(obj, "failed")
+                        if "not found" in err:
+                            # The engine doesn't have this object (fresh
+                            # session, or deleted engine-side). KEEP the id —
+                            # the engine honors Blender-minted ids on create —
+                            # drop it from the engine-known set and queue a
+                            # re-create under the same identity.
+                            sync._last_known_bridge_ids.discard(bid)
+                            sync.set_sync_status(obj, "unsent")
+                            uid = getattr(obj, "session_uid", id(obj))
+                            if obj.type == "MESH":
+                                sync._mark_dirty("create", f"create_{uid}", obj)
+                            elif obj.type == "LIGHT":
+                                sync._mark_dirty("create_light", f"create_{uid}", obj)
+                        else:
+                            sync.set_sync_status(obj, "failed")
             except Exception:
                 pass
 
@@ -223,7 +238,7 @@ def send(message):
         return False
 
     try:
-        conn = http.client.HTTPConnection(_host, _port, timeout=5)
+        conn = http.client.HTTPConnection(_host, _port, timeout=2)
         conn.request(
             "POST", "/message",
             body=message,
@@ -265,7 +280,7 @@ def send_and_receive(message):
         return None
 
     try:
-        conn = http.client.HTTPConnection(_host, _port, timeout=5)
+        conn = http.client.HTTPConnection(_host, _port, timeout=2)
         conn.request(
             "POST", "/message",
             body=message,
@@ -304,7 +319,7 @@ def poll():
 
     try:
         start = time.time()
-        conn = http.client.HTTPConnection(_host, _port, timeout=2)
+        conn = http.client.HTTPConnection(_host, _port, timeout=1)
         conn.request("GET", "/poll")
         resp = conn.getresponse()
         body = resp.read().decode("utf-8")
@@ -398,62 +413,103 @@ def ensure_reconnect_timer():
         pass
 
 
+# Reconnect probe result, written by a background thread, read by the timer.
+# The probe's blocking HTTP must NEVER run on the main thread: each attempt
+# froze the UI for up to its full timeout, and with infinite retry that read
+# as "Blender is almost completely unresponsive while reconnecting".
+_probe_lock = threading.Lock()
+_probe_state = "idle"       # idle | running | ok | failed
+_probe_session = None
+
+
+def _probe_status_blocking(host, port):
+    """Background thread body — must not touch bpy."""
+    global _probe_state, _probe_session
+    result = "failed"
+    session = None
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=2)
+        conn.request("GET", "/status")
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8")
+        conn.close()
+        if resp.status == 200:
+            session = json.loads(body).get("sessionId")
+            result = "ok"
+    except Exception:
+        pass
+    with _probe_lock:
+        _probe_state = result
+        _probe_session = session
+
+
 def _attempt_reconnect():
     """Timer callback: try to reconnect. Retries FOREVER with backoff capped
     at _RECONNECT_MAX_DELAY — engine hot-compiles and editor restarts
     routinely outlast any finite budget, and a silent give-up is
     indistinguishable from never-having-tried. Manual Disconnect is the only
-    way to stop. Body is fully contained so an exception can't kill the
-    retry organ itself."""
+    way to stop. The blocking HTTP probe runs in a background thread; this
+    tick only launches it and reads its result, so the UI never stalls.
+    Body is fully contained so an exception can't kill the retry organ."""
     global _state, _reconnect_attempt, _consecutive_failures, _session_id, \
-        _reconnect_timer_registered
+        _reconnect_timer_registered, _probe_state, _probe_session
 
     try:
         if _state != RECONNECTING:
             _reconnect_timer_registered = False
+            with _probe_lock:
+                _probe_state = "idle"
             return None  # Stop timer
 
+        with _probe_lock:
+            probe = _probe_state
+            session = _probe_session
+
+        if probe == "running":
+            return 0.25  # Probe in flight — check back shortly
+
+        if probe == "ok":
+            with _probe_lock:
+                _probe_state = "idle"
+            _session_id = session
+            _state = CONNECTED
+            _consecutive_failures = 0
+            _reconnect_attempt = 0
+            print(f"[s&box Bridge] Reconnected! Session: {_session_id}")
+            _reconnect_timer_registered = False
+            notify_ui()
+
+            # Restart the sync timer and trigger reconciliation
+            try:
+                from . import sync
+                sync.start_timer()
+                sync.send_sync()
+            except Exception:
+                pass
+
+            return None  # Stop timer
+
+        if probe == "failed":
+            with _probe_lock:
+                _probe_state = "idle"
+            # Exponential backoff capped low — this loops forever, so the cap
+            # is the steady-state retry period, not a countdown to giving up.
+            try:
+                base = bpy.context.scene.sbox_bridge.reconnect_interval
+            except Exception:
+                base = 3.0
+            return min(base * (2 ** min(_reconnect_attempt - 1, 6)), _RECONNECT_MAX_DELAY)
+
+        # idle — launch the next probe
         _reconnect_attempt += 1
         print(f"[s&box Bridge] Reconnect attempt {_reconnect_attempt}...")
         notify_ui()
-
-        try:
-            conn = http.client.HTTPConnection(_host, _port, timeout=3)
-            conn.request("GET", "/status")
-            resp = conn.getresponse()
-            body = resp.read().decode("utf-8")
-            conn.close()
-
-            if resp.status == 200:
-                data = json.loads(body)
-                _session_id = data.get("sessionId")
-                _state = CONNECTED
-                _consecutive_failures = 0
-                _reconnect_attempt = 0
-                print(f"[s&box Bridge] Reconnected! Session: {_session_id}")
-                _reconnect_timer_registered = False
-                notify_ui()
-
-                # Restart the sync timer and trigger reconciliation
-                try:
-                    from . import sync
-                    sync.start_timer()
-                    sync.send_sync()
-                except Exception:
-                    pass
-
-                return None  # Stop timer
-
-        except Exception as e:
-            print(f"[s&box Bridge] Reconnect failed: {e}")
-
-        # Exponential backoff capped low — this loops forever, so the cap is
-        # the steady-state retry period, not a countdown to giving up.
-        try:
-            base = bpy.context.scene.sbox_bridge.reconnect_interval
-        except Exception:
-            base = 3.0
-        return min(base * (2 ** (_reconnect_attempt - 1)), _RECONNECT_MAX_DELAY)
+        with _probe_lock:
+            _probe_state = "running"
+        threading.Thread(
+            target=_probe_status_blocking, args=(_host, _port), daemon=True
+        ).start()
+        return 0.25
 
     except Exception as e:
         print(f"[s&box Bridge] Reconnect tick error (contained): {e}")

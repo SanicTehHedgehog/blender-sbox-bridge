@@ -121,11 +121,13 @@ class SboxBridgeSettings(bpy.types.PropertyGroup):
     )
     is_connected: bpy.props.BoolProperty(name="Connected", default=False)
     scale_factor: bpy.props.FloatProperty(
-        name="Scale Factor", default=16.0, min=0.001, max=10000.0,
+        name="Scale Factor", default=40.0, min=0.001, max=10000.0,
         description=(
-            "Blender unit to s&box source-unit multiplier. 16 is the idiomatic "
-            "default (1 Blender unit = 16 source units). Changing this re-bakes "
-            "every bridged mesh's vertices and triggers a full resync."
+            "Blender unit to s&box source-unit multiplier. Default 40: near-"
+            "real scale (1.6% off true inches) where a 2 m wall is 80 units "
+            "next to the 72-unit player, and with grid 40 one grid cell is "
+            "exactly 1 m. Changing this re-bakes every bridged mesh's "
+            "vertices and triggers a full resync."
         ),
         update=_on_scale_factor_changed,
     )
@@ -133,12 +135,20 @@ class SboxBridgeSettings(bpy.types.PropertyGroup):
         name="Auto Sync", default=True,
         description="Automatically sync scene changes",
     )
+    sync_on_connect: bpy.props.BoolProperty(
+        name="Sync on Connect", default=False,
+        description=(
+            "Request a full scene sync automatically on Connect and on engine "
+            "restart. Off: connect is instant — press Sync All when you want "
+            "to reconcile the two scenes"
+        ),
+    )
     project_assets_path: bpy.props.StringProperty(
         name="Assets Path", default="", subtype='DIR_PATH',
         description="Path to the s&box project's Assets folder (for material/texture export)",
     )
     grid_size: bpy.props.IntProperty(
-        name="Grid Size", default=16, min=1, max=256,
+        name="Grid Size", default=40, min=1, max=256,
         description=(
             "Bridge grid size in s&box source units. Mirrored to the "
             "s&box editor's grid spacing and to Blender's viewport "
@@ -193,6 +203,11 @@ classes = (
     panel.SBOX_OT_SelectBridgeObject,
     panel.SBOX_OT_ConfirmPendingDeletes,
     panel.SBOX_OT_CancelPendingDeletes,
+    panel.SBOX_OT_ConfirmInboundDeletes,
+    panel.SBOX_OT_RestoreInboundDeletes,
+    panel.SBOX_OT_ScalePreset,
+    panel.SBOX_OT_AlignSnap,
+    panel.SBOX_OT_AddPlayerReference,
     panel.SBOX_PT_BridgePanel,
 )
 
@@ -241,6 +256,10 @@ def unregister():
     connection.disconnect()
     sync.stop_timer()
     _unregister_keymaps()
+    try:
+        panel.clear_material_previews()
+    except Exception:
+        pass
     if sync.on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(sync.on_depsgraph_update)
     if sync.on_undo_post in bpy.app.handlers.undo_post:

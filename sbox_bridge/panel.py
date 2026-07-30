@@ -4,6 +4,7 @@ Provides connect/disconnect, sync controls, grid, warnings, and material managem
 """
 
 import bpy
+import os
 import time
 import traceback
 from . import connection
@@ -11,6 +12,37 @@ from . import sync
 
 
 _section_errors_printed = set()
+
+# Thumbnail cache for generated bridge materials (Blender preview icons).
+_material_previews = None
+
+
+def _material_preview_icon(image_path):
+    """icon_id for an image file, cached in a bpy.utils.previews collection.
+    Keyed by path+mtime so a re-copied texture refreshes its thumbnail."""
+    global _material_previews
+    if _material_previews is None:
+        import bpy.utils.previews
+        _material_previews = bpy.utils.previews.new()
+    try:
+        key = f"{image_path}:{os.path.getmtime(image_path)}"
+    except OSError:
+        return None
+    if key not in _material_previews:
+        _material_previews.load(key, image_path, 'IMAGE')
+    return _material_previews[key].icon_id
+
+
+def clear_material_previews():
+    """Release the preview collection (called from addon unregister)."""
+    global _material_previews
+    if _material_previews is not None:
+        try:
+            import bpy.utils.previews
+            bpy.utils.previews.remove(_material_previews)
+        except Exception:
+            pass
+        _material_previews = None
 
 
 def _draw_section_error(layout, section, exc):
@@ -106,7 +138,15 @@ class SBOX_OT_Connect(bpy.types.Operator):
                 elif obj.type == "LIGHT" and not sync.get_bridge_id(obj):
                     if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
                         untracked += 1
-            sync.send_sync()
+            # Full sync on connect is opt-in: for large scenes the engine
+            # answers with every object's full mesh data, which stalls both
+            # sides. Default is connect-only; Sync All does the reconcile.
+            if getattr(settings, "sync_on_connect", False):
+                sync.send_sync()
+            else:
+                sync.log_activity(
+                    "Connected — sync on connect is off, use Sync All to reconcile"
+                )
             if untracked:
                 sync.log_activity(
                     f"Connected — {untracked} untracked object(s), "
@@ -189,8 +229,17 @@ class SBOX_OT_SyncAll(bpy.types.Operator):
         for obj in list(bpy.data.objects):
             if obj.get("sbox_scene_id") or obj.get("sbox_type"):
                 continue
+            bid = sync.get_bridge_id(obj)
+            # Never resurrect objects held in Bridge Trash.
+            if bid and bid in sync._inbound_pending_deletes:
+                continue
+            # Create when the ENGINE doesn't have it — not when the object
+            # lacks an id. Objects keep their id across engine sessions now,
+            # so an id the engine doesn't know must go down the create path
+            # (which re-sends it under the same identity).
+            engine_has = bid and bid in sync._last_known_bridge_ids
             if obj.type == "MESH":
-                if not sync.get_bridge_id(obj):
+                if not engine_has:
                     sync.send_create(obj)
                     created += 1
                 else:
@@ -198,7 +247,7 @@ class SBOX_OT_SyncAll(bpy.types.Operator):
                     updated += 1
             elif obj.type == "LIGHT":
                 if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
-                    if not sync.get_bridge_id(obj):
+                    if not engine_has:
                         sync.send_create_light(obj)
                         created += 1
                     else:
@@ -237,8 +286,9 @@ class SBOX_OT_ForceResync(bpy.types.Operator):
                 "You will lose:\n"
                 "  • Any custom materials applied in s&box (water shaders, "
                 "manually-set vmats)\n"
-                "  • Any geometry edits made in s&box on bridge objects\n"
-                "  • All bridge object IDs (re-issued on recreate)\n\n"
+                "  • Any geometry edits made in s&box on bridge objects\n\n"
+                "Bridge IDs are preserved (Blender owns them; objects are "
+                "re-created under the same identity).\n\n"
                 "Continue?"
             ),
             title="Force Resync — destructive",
@@ -254,51 +304,43 @@ class SBOX_OT_ForceResync(bpy.types.Operator):
                 continue
             if obj.type in ("MESH", "LIGHT"):
                 bid = sync.get_bridge_id(obj)
-                if bid:
+                if bid and bid not in sync._inbound_pending_deletes:
                     old_ids.append(bid)
 
         for bid in old_ids:
             sync.send_delete(bid)
 
-        # Step 2: Strip all bridge properties from Blender objects.
-        # Use clear_bridge_id() so we strip the data-side mirror too — without
-        # this, get_bridge_id() falls through to obj.data and returns the
-        # stale ID, which makes step 3's create-branch a no-op. The result
-        # is s&box ends up empty and Blender keeps zombie IDs, then the next
-        # send_sync detects the missing s&box objects and deletes the Blender
-        # ones to "match" — total wipe in both editors.
-        count = 0
-        for obj in list(bpy.data.objects):
-            if obj.get("sbox_scene_id") or obj.get("sbox_type"):
-                continue
-            if obj.type in ("MESH", "LIGHT"):
-                sync.clear_bridge_id(obj)
-                for key in ["sbox_bridge_name", "sbox_bridge_hash",
-                             "sbox_bridge_status", "sbox_bridge_last_sync", "_remote_update_time"]:
-                    if key in obj:
-                        del obj[key]
-                count += 1
-
+        # Step 2: Reset tracking. IDs stay on the objects — Blender owns
+        # them and the engine honors them on re-create, so identity (and the
+        # engine-side mesh caches keyed by it) survives the resync.
         sync._last_known_bridge_ids.clear()
         sync._last_scale.clear()
         sync._last_write_seq.clear()
         sync._material_hash_cache.clear()
         sync._pending_deletes.clear()
 
-        # Step 3: Re-create all objects with fresh IDs
+        # Step 3: Re-create everything under its existing (or fresh) ID.
+        # send_create/send_create_light reuse the object's id; _last_known
+        # was just cleared so nothing is skipped as already-known.
+        count = 0
         for obj in list(bpy.data.objects):
             if obj.get("sbox_scene_id") or obj.get("sbox_type"):
                 continue
             if sync._should_skip_object(obj):
                 continue
-            if obj.type == "MESH" and not sync.get_bridge_id(obj):
+            bid = sync.get_bridge_id(obj)
+            if bid and bid in sync._inbound_pending_deletes:
+                continue
+            if obj.type == "MESH":
                 sync.send_create(obj)
-            elif obj.type == "LIGHT" and not sync.get_bridge_id(obj):
+                count += 1
+            elif obj.type == "LIGHT":
                 if obj.data and obj.data.type not in sync.UNSUPPORTED_LIGHT_TYPES:
                     sync.send_create_light(obj)
+                    count += 1
 
         # Don't call send_sync() — it would re-import old s&box objects as duplicates
-        self.report({"INFO"}, f"Force resynced {count} objects")
+        self.report({"INFO"}, f"Force resynced {count} objects (IDs preserved)")
         return {"FINISHED"}
 
 
@@ -541,6 +583,212 @@ class SBOX_OT_CancelPendingDeletes(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SBOX_OT_ConfirmInboundDeletes(bpy.types.Operator):
+    bl_idname = "sbox.bridge_confirm_inbound_deletes"
+    bl_label = "Confirm s&box Deletes"
+    bl_description = "Permanently delete the objects held in Bridge Trash"
+
+    @classmethod
+    def poll(cls, context):
+        return bool(sync.get_inbound_pending_deletes())
+
+    def execute(self, context):
+        n = sync.confirm_inbound_deletes()
+        self.report({"INFO"}, f"Deleted {n} object(s)")
+        return {"FINISHED"}
+
+
+class SBOX_OT_RestoreInboundDeletes(bpy.types.Operator):
+    bl_idname = "sbox.bridge_restore_inbound_deletes"
+    bl_label = "Restore"
+    bl_description = (
+        "Bring the trashed objects back into the scene and re-send them "
+        "to s&box under their original IDs"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return bool(sync.get_inbound_pending_deletes())
+
+    def execute(self, context):
+        n = sync.restore_inbound_deletes()
+        self.report({"INFO"}, f"Restored {n} object(s)")
+        return {"FINISHED"}
+
+
+class SBOX_OT_ScalePreset(bpy.types.Operator):
+    bl_idname = "sbox.bridge_scale_preset"
+    bl_label = "Scale Preset"
+    bl_description = (
+        "Set scale factor AND grid together so one grid cell is always "
+        "exactly 1 m — the visual grid never moves out from under existing work"
+    )
+
+    # Each preset sets scale_factor and grid_size to the SAME number, so the
+    # overlay cell (grid_size / scale_factor) is exactly 1 m in every preset.
+    # This is why 39.37 (true inches) is not offered: it's incommensurable
+    # with a metric grid — the cell became 0.406 m, new snapped work stopped
+    # landing on old module seams, and gaps appeared. 40 is 1.6% off true
+    # inches and keeps the grid exact.
+    preset: bpy.props.EnumProperty(items=[
+        ('METRIC40', "40 — recommended",
+         "1 m = 40 units, grid cell stays exactly 1 m. Near-real scale "
+         "(1.6% off true inches): a 2 m wall is 80 units next to the "
+         "72-unit player. Keep modeling on the same 1 m grid you started on"),
+        ('GRID32', "32",
+         "1 m = 32 units, grid cell stays 1 m. ~19% smaller than real: a "
+         "2 m opening (64u) is too short for the 72u player — build "
+         "doorways 2.5 m+ at this scale"),
+        ('CLASSIC16', "16",
+         "1 m = 16 units, grid cell stays 1 m. Half-scale world: a 2 m "
+         "wall is 32 units, waist-high next to the player"),
+    ])
+
+    def execute(self, context):
+        values = {'METRIC40': 40, 'GRID32': 32, 'CLASSIC16': 16}
+        v = values[self.preset]
+        s = context.scene.sbox_bridge
+        # Grid first, then scale — both updates push to the engine and the
+        # overlay lands on v/v = exactly 1 m per cell.
+        s.grid_size = v
+        s.scale_factor = float(v)
+        self.report({"INFO"},
+                    f"Scale {v} u/m, grid {v} (1 m cells) — bridged objects will resync")
+        return {"FINISHED"}
+
+
+class SBOX_OT_AlignSnap(bpy.types.Operator):
+    bl_idname = "sbox.bridge_align_snap"
+    bl_label = "Align Snapping"
+    bl_description = (
+        "Configure Blender's snapping to the bridge grid: absolute grid "
+        "snap matching the viewport overlay (grid_size / scale_factor per cell)"
+    )
+
+    def execute(self, context):
+        ts = context.scene.tool_settings
+        ts.use_snap = True
+        # Blender 4+ has 'GRID' (absolute) as its own snap element; older
+        # builds spell it 'INCREMENT' + use_snap_grid_absolute.
+        try:
+            ts.snap_elements = {'GRID'}
+        except Exception:
+            ts.snap_elements = {'INCREMENT'}
+            try:
+                ts.use_snap_grid_absolute = True
+            except Exception:
+                pass
+        s = context.scene.sbox_bridge
+        cell = s.grid_size / max(s.scale_factor, 1e-6)
+        self.report({"INFO"}, f"Snap aligned: {s.grid_size}u grid = {cell:.3f}m per cell")
+        return {"FINISHED"}
+
+
+class SBOX_OT_AddPlayerReference(bpy.types.Operator):
+    bl_idname = "sbox.bridge_add_player_ref"
+    bl_label = "Player Reference"
+    bl_description = (
+        "Add the Citizen model (non-synced, normalized to the 72-unit player "
+        "height at the current scale factor) at the 3D cursor. Falls back to "
+        "a 32 x 32 x 72 unit wireframe box if Citizen.fbx is missing"
+    )
+
+    CITIZEN_FBX = r"C:\Users\Kami\Documents\Blender\Citizen.fbx"
+    TEMPLATE_COLLECTION = "sbox_citizen_template"
+
+    def execute(self, context):
+        import os
+
+        s = context.scene.sbox_bridge
+        sf = max(s.scale_factor, 1e-6)
+        target_h = 72.0 / sf
+
+        # Import the FBX at most ONCE, into an unlinked template collection.
+        # The first version re-imported per click — the second copy's
+        # duplicated armature/materials hard-crashed Blender's depsgraph
+        # (null material in DepsgraphNodeBuilder::build_materials). Every
+        # spawn is now a collection-instance empty sharing the one template:
+        # no new meshes, no new materials, no armature duplication.
+        template = bpy.data.collections.get(self.TEMPLATE_COLLECTION)
+        if template is not None and not template.objects:
+            template = None
+        if template is None and os.path.isfile(self.CITIZEN_FBX):
+            template = self._import_template(context)
+
+        if template is not None:
+            th = float(template.get("citizen_height", 0.0))
+            f = (target_h / th) if th > 1e-6 else 1.0
+            empty = bpy.data.objects.new("s&box Player Reference", None)
+            empty.instance_type = 'COLLECTION'
+            empty.instance_collection = template
+            empty.empty_display_size = 0.1
+            empty["sbox_bridge_ignore"] = True
+            empty.scale = (f, f, f)
+            empty.location = context.scene.cursor.location
+            context.collection.objects.link(empty)
+            self.report({"INFO"},
+                        f"Citizen reference: {target_h:.2f}m tall at current scale")
+            return {"FINISHED"}
+
+        w = 32.0 / sf
+        hx = w / 2.0
+        verts = [(-hx, -hx, 0), (hx, -hx, 0), (hx, hx, 0), (-hx, hx, 0),
+                 (-hx, -hx, target_h), (hx, -hx, target_h),
+                 (hx, hx, target_h), (-hx, hx, target_h)]
+        faces = [(0, 1, 2, 3), (7, 6, 5, 4), (0, 4, 5, 1),
+                 (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
+        mesh = bpy.data.meshes.new("sbox_player_ref")
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+        obj = bpy.data.objects.new("s&box Player (32x32x72u)", mesh)
+        obj.display_type = 'WIRE'
+        obj["sbox_bridge_ignore"] = True
+        obj.location = context.scene.cursor.location
+        context.collection.objects.link(obj)
+        self.report({"INFO"},
+                    f"Player reference: {w:.2f}m x {w:.2f}m x {target_h:.2f}m at current scale")
+        return {"FINISHED"}
+
+    def _import_template(self, context):
+        """One-time FBX import into an UNLINKED collection. The collection is
+        kept alive by the instance empties that reference it; if the user
+        deletes every instance and saves, Blender purges it and the next
+        click re-imports."""
+        from mathutils import Vector
+        try:
+            before = set(bpy.data.objects)
+            bpy.ops.import_scene.fbx(filepath=self.CITIZEN_FBX)
+            imported = [o for o in bpy.data.objects if o not in before]
+            if not imported:
+                return None
+
+            zmin, zmax = 1e18, -1e18
+            for o in imported:
+                # Never synced — see _should_skip_object.
+                o["sbox_bridge_ignore"] = True
+                if o.type == 'MESH':
+                    for corner in o.bound_box:
+                        z = (o.matrix_world @ Vector(corner)).z
+                        zmin = min(zmin, z)
+                        zmax = max(zmax, z)
+
+            col = bpy.data.collections.new(self.TEMPLATE_COLLECTION)
+            for o in imported:
+                for c in list(o.users_collection):
+                    try:
+                        c.objects.unlink(o)
+                    except Exception:
+                        pass
+                col.objects.link(o)
+            # Authored height (~0.72 m: s&box units at FBX cm scale) —
+            # instances scale themselves to player height from this.
+            col["citizen_height"] = max(zmax - zmin, 1e-6)
+            return col
+        except Exception as e:
+            self.report({"WARNING"}, f"Citizen import failed ({e}) — using box")
+            return None
+
+
 class SBOX_OT_DeleteBridgeMaterial(bpy.types.Operator):
     bl_idname = "sbox.delete_bridge_material"
     bl_label = "Delete Material"
@@ -683,7 +931,17 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
             settings = context.scene.sbox_bridge
             box.prop(settings, "sync_mode")
             box.prop(settings, "auto_sync")
+            box.prop(settings, "sync_on_connect")
             box.prop(settings, "scale_factor")
+            sp = box.row(align=True)
+            for pid, label, val in (('METRIC40', "40", 40.0),
+                                    ('GRID32', "32", 32.0),
+                                    ('CLASSIC16', "16", 16.0)):
+                op = sp.operator("sbox.bridge_scale_preset", text=label,
+                                 depress=(abs(settings.scale_factor - val) < 0.01))
+                op.preset = pid
+            sp.operator("sbox.bridge_align_snap", text="", icon='SNAP_GRID')
+            sp.operator("sbox.bridge_add_player_ref", text="", icon='ARMATURE_DATA')
             row = box.row(align=True)
             row.label(text="Grid")
             row.prop(settings, "grid_size", text="")
@@ -818,7 +1076,6 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
             if pending:
                 layout.separator()
                 box = layout.box()
-                import time
                 oldest = min(t for _, t in pending)
                 remaining = max(0, sync.PENDING_DELETE_TIMEOUT - (time.time() - oldest))
                 box.label(text=f"{len(pending)} pending deletion(s) ({remaining:.0f}s)", icon="TRASH")
@@ -827,6 +1084,32 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 row.operator("sbox.bridge_cancel_deletes", icon="CANCEL")
         except Exception as e:
             _draw_section_error(layout, "Pending Deletes", e)
+
+        # ── Bridge Trash (inbound s&box deletes, never auto-applied) ──
+        try:
+            trash = sync.get_inbound_pending_deletes()
+            if trash:
+                layout.separator()
+                box = layout.box()
+                row = box.row()
+                row.alert = True
+                row.label(text=f"s&box deleted {len(trash)} object(s)", icon="TRASH")
+                for info in list(trash.values())[:5]:
+                    r = box.row()
+                    r.scale_y = 0.7
+                    r.label(text=info.get("name", "?"), icon="DOT")
+                if len(trash) > 5:
+                    r = box.row()
+                    r.scale_y = 0.7
+                    r.label(text=f"...and {len(trash) - 5} more")
+                box.label(text="Held in Bridge Trash — nothing deleted yet")
+                row = box.row(align=True)
+                row.operator("sbox.bridge_confirm_inbound_deletes",
+                             text="Delete Here Too", icon="CHECKMARK")
+                row.operator("sbox.bridge_restore_inbound_deletes",
+                             text="Restore", icon="RECOVER_LAST")
+        except Exception as e:
+            _draw_section_error(layout, "Bridge Trash", e)
 
         # ── Warnings — auto-expire from panel, one-click clear ────
         # A warnings list that only ever grows trains the eye to ignore it.
@@ -899,10 +1182,20 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                 if os.path.isdir(bridge_dir):
                     vmats = [f for f in os.listdir(bridge_dir) if f.endswith(".vmat")]
                     if vmats:
+                        dir_files = os.listdir(bridge_dir)
                         for vmat in sorted(vmats):
                             mat_name = vmat[:-5]
                             row = box.row(align=True)
-                            row.label(text=mat_name, icon="SHADING_RENDERED")
+                            icon_id = None
+                            for f in dir_files:
+                                if f.startswith(mat_name + "_color."):
+                                    icon_id = _material_preview_icon(
+                                        os.path.join(bridge_dir, f))
+                                    break
+                            if icon_id:
+                                row.label(text=mat_name, icon_value=icon_id)
+                            else:
+                                row.label(text=mat_name, icon="SHADING_RENDERED")
                             op = row.operator("sbox.delete_bridge_material", text="", icon="TRASH")
                             op.material_name = mat_name
                     else:
