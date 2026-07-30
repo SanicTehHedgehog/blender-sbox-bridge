@@ -690,11 +690,32 @@ class SBOX_OT_AddPlayerReference(bpy.types.Operator):
     bl_description = (
         "Add the Citizen model (non-synced, normalized to the 72-unit player "
         "height at the current scale factor) at the 3D cursor. Falls back to "
-        "a 32 x 32 x 72 unit wireframe box if Citizen.fbx is missing"
+        "a 32 x 32 x 72 unit wireframe box if no Citizen FBX is found (set "
+        "one under Sync > Citizen FBX)"
     )
 
-    CITIZEN_FBX = r"C:\Users\Kami\Documents\Blender\Citizen.fbx"
     TEMPLATE_COLLECTION = "sbox_citizen_template"
+
+    @staticmethod
+    def resolve_citizen_fbx(settings):
+        """First existing candidate: the user-set path, an FBX bundled in the
+        addon's assets folder, or Documents/Blender/Citizen.fbx. None if no
+        candidate exists (the operator then falls back to the wireframe box —
+        s&box itself ships only compiled .vmdl_c, so there is nothing to
+        auto-discover in the engine install)."""
+        import os
+        candidates = []
+        user_path = (settings.citizen_fbx_path or "").strip()
+        if user_path:
+            candidates.append(bpy.path.abspath(user_path))
+        candidates.append(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "assets", "Citizen.fbx"))
+        candidates.append(os.path.join(
+            os.path.expanduser("~"), "Documents", "Blender", "Citizen.fbx"))
+        for p in candidates:
+            if p and os.path.isfile(p):
+                return p
+        return None
 
     def execute(self, context):
         import os
@@ -702,6 +723,7 @@ class SBOX_OT_AddPlayerReference(bpy.types.Operator):
         s = context.scene.sbox_bridge
         sf = max(s.scale_factor, 1e-6)
         target_h = 72.0 / sf
+        citizen_fbx = self.resolve_citizen_fbx(s)
 
         # Import the FBX at most ONCE, into an unlinked template collection.
         # The first version re-imported per click — the second copy's
@@ -712,8 +734,8 @@ class SBOX_OT_AddPlayerReference(bpy.types.Operator):
         template = bpy.data.collections.get(self.TEMPLATE_COLLECTION)
         if template is not None and not template.objects:
             template = None
-        if template is None and os.path.isfile(self.CITIZEN_FBX):
-            template = self._import_template(context)
+        if template is None and citizen_fbx is not None:
+            template = self._import_template(context, citizen_fbx)
 
         if template is not None:
             th = float(template.get("citizen_height", 0.0))
@@ -745,11 +767,13 @@ class SBOX_OT_AddPlayerReference(bpy.types.Operator):
         obj["sbox_bridge_ignore"] = True
         obj.location = context.scene.cursor.location
         context.collection.objects.link(obj)
+        hint = "" if citizen_fbx else " (no Citizen FBX found — set one under Sync)"
         self.report({"INFO"},
-                    f"Player reference: {w:.2f}m x {w:.2f}m x {target_h:.2f}m at current scale")
+                    f"Player reference: {w:.2f}m x {w:.2f}m x {target_h:.2f}m"
+                    f" at current scale{hint}")
         return {"FINISHED"}
 
-    def _import_template(self, context):
+    def _import_template(self, context, citizen_fbx):
         """One-time FBX import into an UNLINKED collection. The collection is
         kept alive by the instance empties that reference it; if the user
         deletes every instance and saves, Blender purges it and the next
@@ -757,7 +781,7 @@ class SBOX_OT_AddPlayerReference(bpy.types.Operator):
         from mathutils import Vector
         try:
             before = set(bpy.data.objects)
-            bpy.ops.import_scene.fbx(filepath=self.CITIZEN_FBX)
+            bpy.ops.import_scene.fbx(filepath=citizen_fbx)
             imported = [o for o in bpy.data.objects if o not in before]
             if not imported:
                 return None
@@ -953,6 +977,11 @@ class SBOX_PT_BridgePanel(bpy.types.Panel):
                                       depress=(settings.grid_size == v))
                 op.value = v
             box.prop(settings, "project_assets_path")
+            # Only surface the Citizen FBX picker when nothing auto-resolves;
+            # with a working candidate the button just works and the field is
+            # clutter.
+            if SBOX_OT_AddPlayerReference.resolve_citizen_fbx(settings) is None:
+                box.prop(settings, "citizen_fbx_path")
             box.prop(settings, "auto_reconnect")
 
             row = box.row(align=True)

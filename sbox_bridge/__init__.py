@@ -147,6 +147,15 @@ class SboxBridgeSettings(bpy.types.PropertyGroup):
         name="Assets Path", default="", subtype='DIR_PATH',
         description="Path to the s&box project's Assets folder (for material/texture export)",
     )
+    citizen_fbx_path: bpy.props.StringProperty(
+        name="Citizen FBX", default="", subtype='FILE_PATH',
+        description=(
+            "Optional path to a Citizen model FBX for the Player Reference "
+            "button (s&box does not ship one — export your own or leave "
+            "empty). Empty: auto-checks the addon's assets folder and "
+            "Documents/Blender/Citizen.fbx, else uses a wireframe box"
+        ),
+    )
     grid_size: bpy.props.IntProperty(
         name="Grid Size", default=40, min=1, max=256,
         description=(
