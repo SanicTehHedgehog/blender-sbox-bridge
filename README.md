@@ -41,7 +41,7 @@ Model, transform, texture, and map from Blender directly to the s&box scene edit
 - **Delete safety** — Blender-side deletes wait 30 seconds before confirming to the engine (undo cancels them). Engine-side deletes never destroy your Blender objects: they move to a hidden **Bridge Trash** collection with one-click Restore
 - **Light sync** — Point, Spot, and Sun lights sync between Blender and s&box
 - **PBR materials** — Principled BSDF nodes auto-generate `.vmat` files with textures, including emissive
-- **Near-real scale presets** — Scale Factor 40 (default) pairs with grid 40 so one grid cell is exactly 1 m and a 2 m wall is 80 units next to the 72-unit player; presets `40 / 32 / 16`
+- **Near-real scale presets** — Scale Factor 40 (default) pairs with grid 40 so one grid cell is exactly 1 m and a 2 m wall is 80 units next to the 72-unit player; presets `40 / 32 / 16` (this one can be strange scale is 40 for sizing issues feel free to change but for mapping this scale works well, once started do not change scale work in 16 grid, s&box will update as well.)
 - **Player Reference** — One click drops a Citizen-scale reference at the 3D cursor (uses your own Citizen FBX if configured, wireframe box otherwise)
 - **Grid sync** — Bridge `grid_size` mirrors `Gizmo.Settings.GridSpacing` in s&box and the viewport overlay grid in Blender. Preset buttons `1/2/4/8/16/32/64/128`, `[` / `]` to halve / double, plus an Align Snapping button that matches Blender's snap to the overlay grid
 - **Chunked transfer** — Large meshes (20k+ vertices) stream in chunks without freezing
